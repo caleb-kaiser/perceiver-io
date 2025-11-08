@@ -162,10 +162,10 @@ def main():
         num_frequency_bands=16,
         num_latents=128,
         num_latent_channels=256,
-        num_cross_attention_heads=4,
-        num_self_attention_heads=4,
-        num_self_attention_layers_per_block=4,
-        num_self_attention_blocks=4,
+        num_cross_attention_heads=8,
+        num_self_attention_heads=8,
+        num_self_attention_layers_per_block=8,
+        num_self_attention_blocks=8,
         dropout=0.1,
     ).to(device)
 
