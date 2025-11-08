@@ -166,7 +166,7 @@ def main():
         num_self_attention_heads=16,
         num_self_attention_layers_per_block=16,
         num_self_attention_blocks=16,
-        dropout=0.,
+        dropout=0.15,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
