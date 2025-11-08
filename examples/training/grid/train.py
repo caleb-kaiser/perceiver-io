@@ -159,14 +159,14 @@ def main():
         num_classes=10,
         num_value_embeddings=10,
         value_embedding_dim=64,
-        num_frequency_bands=16,
-        num_latents=256,
-        num_latent_channels=512,
+        num_frequency_bands=32,
+        num_latents=17*17,
+        num_latent_channels=256,
         num_cross_attention_heads=8,
         num_self_attention_heads=8,
         num_self_attention_layers_per_block=8,
         num_self_attention_blocks=8,
-        dropout=0.1,
+        dropout=0.,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
