@@ -165,7 +165,7 @@ def main():
         num_cross_attention_heads=4,
         num_self_attention_heads=4,
         num_self_attention_layers_per_block=4,
-        num_self_attention_blocks=1,
+        num_self_attention_blocks=4,
         dropout=0.1,
     ).to(device)
 
