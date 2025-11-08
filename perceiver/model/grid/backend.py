@@ -19,7 +19,7 @@ from perceiver.model.core import (
 class GridInputAdapter(InputAdapter):
     def __init__(
         self,
-        grid_shape: Tuple[int, int],
+        grid_shape: Tuple[int, int] = (30, 30),
         num_value_embeddings: int = 10,
         value_embedding_dim: int = 32,
         num_frequency_bands: int = 16,

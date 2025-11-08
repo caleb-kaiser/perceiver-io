@@ -1,243 +1,244 @@
-## Plan: Grid-to-Grid Perceiver IO (PyTorch, no Lightning)
+## Plan: Episodic Perceiver IO for ARC-AGI Grid Puzzles
 
-This plan describes how to implement and train a Perceiver IO model that maps 17x17 integer grids to 17x17 integer grids using only PyTorch building blocks from this repository. It focuses exclusively on the Perceiver IO variant.
+### Scope and goal
+- Build an episodic, meta-learning variant of Perceiver IO that induces a puzzle-specific transformation from a small support set of input/output grid pairs and applies it to a new query input grid.
+- Focus exclusively on Perceiver IO (not Perceiver/AR). Keep changes minimal and localized to a new backend and a dedicated training script (no Lightning).
 
-- **Input**: 17x17 integers in [0, 9]
-- **Output**: 17x17 integers in [0, 9]
-- **Dataset**: `data/training_data.json` with keys `train` (len=219) and `test`
+Target setting (default, configurable):
+- Each episode = one puzzle
+- Support = K examples (default K=3)
+- Query = 1 input grid (supervised training has its target; inference doesn’t)
+- Grid size = 17×17; values in [0, 9] (vocabulary can be generalized)
 
-## Background: Perceiver IO in this repo
 
-Perceiver IO is assembled from a generic encoder and decoder, plus task-specific adapters:
-- `PerceiverEncoder` cross-attends from learned latents to adapted inputs, then applies self-attention blocks.
-- `PerceiverDecoder` cross-attends from output queries to the latent array, then an output adapter maps to task logits.
+### Guiding design principle
+Use Perceiver IO’s encoder latent array as an episodic memory written from the support examples. The decoder then answers the query by cross-attending from output-position queries (derived from the query input grid) into that support-written latent memory.
 
-Key references (for shapes and wiring):
-- Encoder and decoder forward passes in `perceiver/model/core/modules.py`:
-  - `PerceiverEncoder.forward`: returns either `x_latent` or `(x_latent, x_adapted)`
-  - `PerceiverDecoder.forward`: `output_query = output_query_provider(x_adapted)` → cross-attn → `output_adapter(...)`
-- Query and adapters in `perceiver/model/core/adapter.py`:
-  - `TrainableQueryProvider` (learned queries), `ClassificationOutputAdapter` (linear over query channels)
-- A dense prediction example mirroring our need is optical flow:
-  - `perceiver/model/vision/optical_flow/backend.py` uses `x_adapted` as the decoder query input and reshapes output to image shape.
 
-Implications for a 17x17 grid-to-grid task:
-- Treat the grid as a 2D “image” with 1 semantic channel, add 2D Fourier position encodings, flatten to a sequence of length `O = 289`.
-- Use `x_adapted` as decoder queries (one query per grid cell), so the decoder predicts per-cell outputs in parallel.
+### Architectural overview
+We extend the existing grid backend to an episodic variant:
 
-## Data loading and preprocessing
+- Encoder input: a single concatenated token sequence containing
+  - K support input grids
+  - K support output grids
+  - 1 query input grid
+- Decoder query: tokens derived only from the query input grid (one query per output cell)
+- Output: per-cell classification logits for the query output grid
 
-### File format
-`data/training_data.json`:
-- `{ "train": [ { "input": [[...17] x 17], "output": [[...17] x 17] }, ... ], "test": [...] }`
-- Values are integers in [0, 9].
+This preserves the Perceiver IO pattern:
+- Encoder: latent array cross-attends to a long, task-specific input sequence (here: all support and query-input tokens), then self-attends.
+- Decoder: output queries (here: query-input tokens) cross-attend into latents and are mapped to per-cell classes.
 
-### Dataset class (PyTorch)
-- Implement `GridDataset(torch.utils.data.Dataset)` that:
-  - Loads the JSON once in `__init__`.
-  - Stores a list of pairs `(input_grid, output_grid)`, each as `torch.LongTensor` of shape `(17, 17)`.
-  - Optionally supports a `transform` hook (e.g., value normalization if doing regression, or augmentation if desired).
-- `__getitem__` returns `(x: LongTensor[17,17], y: LongTensor[17,17])`.
 
-### Collation
-- Use default collation; batches become `LongTensor[b, 17, 17]` for both `x` and `y`.
+### Key components to add
+1) Episodic input adapter
+   - `EpisodicGridInputAdapter` (new):
+     - Reuses the single-grid embedding routine (value embedding + 2D Fourier position encoding) to encode any grid into `(B, H*W, C_base)`.
+     - Adds:
+       - Role embeddings: one of {support_input, support_output, query_input}.
+       - Pair-index embeddings for support examples: {0, …, K-1}.
+     - Returns a concatenated sequence:
+       `[support_0_in, support_0_out, support_1_in, support_1_out, ..., support_{K-1}_in, support_{K-1}_out, query_in]`
+       Each segment has shape `(B, H*W, C_base + C_role + C_pair)`.
+     - Variable K is supported by concatenation; pair-index embeddings can be implemented as a small learned table up to a configurable `max_support` (default 5), or via sinusoidal embedding of the scalar pair index.
 
-### Encoding strategy
-- Recommended: **Per-cell classification** with 10 classes.
-  - Loss: cross-entropy over per-cell logits.
-  - Benefits: discrete target modeling; natural for values in [0, 9].
-- Alternative: Regression to scalar in [0, 9] with MSE/Huber + rounding at inference. Not recommended here.
+2) Query-only input adapter
+   - Reuse the existing `GridInputAdapter` for the query’s output queries (one token per output position).
+   - Its channel count defines `num_output_query_channels` for the decoder and output adapter.
 
-## Model design (Perceiver IO)
+3) Episodic backend
+   - `EpisodicGridPerceiverIO` (new):
+     - Encoder: `PerceiverEncoder(input_adapter=EpisodicGridInputAdapter, ...)`.
+     - Decoder:
+       - `output_query_provider = GridQueryProvider(num_query_channels=query_adapter.num_input_channels)`
+       - `output_adapter = GridClassificationOutputAdapter(grid_shape, num_output_query_channels=query_adapter.num_input_channels, num_classes)`
+     - Forward signature (train): `forward(support_x: LongTensor[B,K,H,W], support_y: LongTensor[B,K,H,W], query_x: LongTensor[B,H,W]) -> logits[B,H,W,num_classes]`
+       - Build episodic input (support_x, support_y, query_x) and feed to encoder.
+       - Build query-only adapted tokens via `GridInputAdapter(query_x)` and pass as `x_adapted` to the decoder.
+       - Decoder returns per-cell logits; compute CE against `query_y` in the training loop.
+     - Forward signature (inference): `forward_episode(support_x, support_y, query_x)` with no targets.
 
-We build a small custom Perceiver IO for grids, inspired by `ImageClassifier` and `OpticalFlow` backends.
+4) Dataset and training loop (pure PyTorch)
+   - `EpisodicGridDataset`:
+     - Each item loads a puzzle with >= K+1 examples.
+     - Samples/augments K support pairs `(x_i, y_i)` and 1 query `(x_q, y_q)` (during training `y_q` exists; at test-time you may withhold).
+     - Returns tensors shaped `(K,H,W)` for support_x/support_y and `(H,W)` for query_x/query_y.
+   - Training:
+     - Loss: per-cell CrossEntropy on predicted `y_q` (flatten `(B*H*W, C)` vs `(B*H*W,)`), same as current grid training.
+     - Metrics: per-cell accuracy; exact-grid accuracy on the query prediction.
+     - AMP, AdamW, LR-schedule/grad clipping optional.
 
-### Input adapter: `GridInputAdapter`
-- Purpose: Transform the `(B, 17, 17)` integer grid into a sequence with position encodings.
-- Steps:
-  - Value embedding: `nn.Embedding(num_embeddings=10, embedding_dim=E)` to embed each integer (E ∈ {32, 64}).
-  - Position encoding: `FourierPositionEncoding(input_shape=(17, 17), num_frequency_bands=F)` (F ∈ {16, 32}).
-  - Concatenate embedded values and position encodings along channels.
-  - Flatten spatial dims: `(B, 17, 17, C) -> (B, 289, C)` where `C = E + PE`, and `PE = 2 * dims * F + dims` with `dims=2`.
-  - Set `num_input_channels = C`.
 
-Notes:
-- See `FourierPositionEncoding` in `perceiver/model/core/position.py` for channel math and usage.
-- `OpticalFlowInputAdapter` shows the pattern: project features, flatten, concatenate Fourier position encodings, then return `(B, M, C)`.
-
-### Encoder: `PerceiverEncoder`
-- Construct with:
-  - `input_adapter = GridInputAdapter(...)`
-  - `num_latents`: 64–256 (start with 128 for 219 examples)
-  - `num_latent_channels`: 128–256 (start with 256)
-  - Attention heads: 4
-  - `num_self_attention_layers_per_block`: 4–6 (start with 4)
-  - `num_self_attention_blocks`: 1
-  - Dropout: 0.0–0.1 (start with 0.1 for regularization)
-  - For cross-attention qk/v channels: default to adapter `num_input_channels`
-
-Shape summary:
-- Input: `(B, 17, 17)` ints → adapter → `(B, 289, C)`
-- Encoder latent: `(B, N, D)` where `N = num_latents`, `D = num_latent_channels`
-- If `return_adapted_input=True`, also returns `x_adapted: (B, 289, C)`
-
-### Decoder: queries and output adapter
-- Queries: Use `x_adapted` as in optical flow (one query per grid position).
-  - Implement a `GridQueryProvider` equivalent to `OpticalFlowQueryProvider`, which receives `x_adapted` and returns it as queries.
-  - Then `num_output_query_channels = C`.
-- Output adapter:
-  - For classification: `GridClassificationOutputAdapter(num_classes=10, num_output_query_channels=C)` → linear to 10 classes per position and reshape to `(B, 17, 17, 10)`.
-  - For regression: `GridRegressionOutputAdapter(num_output_query_channels=C)` → linear to 1 per position and reshape to `(B, 17, 17)`.
-
-End-to-end forward:
-1) `x_latent, x_adapted = encoder(x, return_adapted_input=True)`
-2) `logits_or_values = decoder(x_latent, x_adapted=x_adapted)`
-
-### Suggested default hyperparameters (small data)
-- `E` (value embedding dim): 32
-- `F` (Fourier bands): 16
-- `C = E + (2 * F + 1) * 2 = 32 + (33 * 2) = 98`
-- `num_latents`: 128
-- `num_latent_channels`: 256
-- Heads: 4
-- Self-attn layers per block: 4
-- Blocks: 1
-- Cross/self widening factors: 1–2 (start with 1)
-- Dropout in attention/MLP: 0.1
-
-## Training (pure PyTorch)
-
-### Loss and targets
-- Classification (recommended):
-  - Model output: `(B, 17, 17, 10)` logits
-  - Targets: `(B, 17, 17)` `LongTensor` in `[0..9]`
-  - Compute loss by reshaping:
-    - `logits.view(B*289, 10)` and `targets.view(B*289)`
-    - `nn.CrossEntropyLoss()`
-
-### Optimizer, schedule, and regularization
-- Optimizer: `AdamW(lr=1e-3, weight_decay=0.01)`
-- Learning rate schedule (optional): cosine decay or step LR after warmup (e.g., 200–500 steps) given small dataset.
-- Gradient clipping: clip global norm at 1.0–2.0.
-- Mixed precision: `torch.cuda.amp.autocast` + `GradScaler` if on GPU.
-- Dropout: 0.1 in attention and MLP for regularization.
-
-### Dataloaders
-- Split: use provided `train` and `test` lists.
-- Batch size: start with 32 (adjust to memory); shuffle train, no shuffle test.
-- Num workers: 2–4.
-
-### Training loop skeleton
-1) Seed RNGs for reproducibility.
-2) Create `GridDataset` for train/test; `DataLoader` with batch size and workers.
-3) Construct model (encoder+decoder) and move to device.
-4) Configure optimizer, optional scheduler, AMP scaler.
-5) For each epoch:
-   - Train loop: forward, compute CE loss, backward, clip, optimizer step, scheduler step.
-   - Eval loop on test: compute per-cell accuracy and loss.
-   - Save best checkpoint by validation loss or accuracy.
-
-### Checkpointing
-- Save: model `state_dict`, optimizer state, scheduler state, epoch, global step, best metric.
-- Filename pattern: `checkpoints/gridio-epoch{E}-acc{ACC:.3f}.pt`.
-
-## Evaluation and metrics
-- Per-cell accuracy: fraction of correct cells over all cells and examples.
-- Exact-grid accuracy: fraction where all 289 cells match.
-- Per-class accuracy (optional) and confusion matrix (flattened over all cells).
-- For regression alternative: MAE/MSE per cell; but classification is preferred here.
-
-## Implementation details (concrete steps and files)
-
-Minimal additions (keep changes small and task-specific):
-1) Implement adapters and model assembly (new module under `perceiver/model/vision/` or `perceiver/model/grid/`):
-   - `GridInputAdapter` (embedding + Fourier positions + flatten)
-   - `GridClassificationOutputAdapter` (linear to 10, reshape to `(B, 17, 17, 10)`)
-   - `GridQueryProvider` (like `OpticalFlowQueryProvider`: identity over `x_adapted`)
-   - `GridPerceiverIO` (wire encoder/decoder similarly to `OpticalFlow`)
-2) Implement `GridDataset` and a small train script (e.g., `examples/training/grid/train.py`) that uses pure PyTorch training loop.
-3) Add a config dataclass like other backends (`PerceiverIOConfig[GridEncoderConfig, GridDecoderConfig]`) if you want CLI/config parity; otherwise pass params directly.
-
-Where to look for examples:
-- Adapter patterns and wiring from `perceiver/model/vision/optical_flow/backend.py`.
-- Core building blocks in `perceiver/model/core/modules.py` and `perceiver/model/core/adapter.py`.
-
-## Tensor shapes (summary)
-- Input grid: `(B, 17, 17)` ints in `[0..9]`
-- After embedding: `(B, 17, 17, E)`
-- Fourier positions: `(B, 17, 17, PE)` where `PE = 2 * (2 * F) + 2`
-- Concatenated: `(B, 17, 17, C=E+PE)` → flatten → `(B, 289, C)`
-- Encoder latent: `(B, N, D)`
-- Decoder queries (`x_adapted`): `(B, 289, C)`
-- Decoder output (classification): `(B, 17, 17, 10)`
-
-## Default hyperparameters for this dataset size
-- Value embedding dim `E`: 32
-- Fourier bands `F`: 16
-- `C`: 98 (approx., per formula above)
-- `num_latents`: 128
-- `num_latent_channels`: 256
-- Heads: 4
-- Self-attn layers per block: 4
-- Blocks: 1
-- Dropout: 0.1
-- Optimizer: AdamW, lr=1e-3, wd=0.01
-- Epochs: 50–200 (use early stopping on test set or hold out val from train if desired)
-- Batch size: 32 (tune)
-
-## Risks and mitigations
-- Small train set (219): risk of overfitting
-  - Use small model, dropout, weight decay, and early stopping.
-  - Optionally perform K-fold cross-validation over the `train` list.
-- Class imbalance: compute per-class stats; consider class weights in CE if skewed.
-- Over-parameterized `C`: if memory constrained, reduce embedding dim `E` or Fourier bands `F`.
-
-## Appendix: Relevant code references in this repo
-
-- Encoder/decoder IO wiring (`PerceiverEncoder`, `PerceiverDecoder`, `PerceiverIO`):
-
-```610:689:perceiver/model/core/modules.py
-class PerceiverDecoder(nn.Module):
-    ...
-    def forward(self, x_latent, x_adapted=None, **kwargs):
-        output_query = self.output_query_provider(x_adapted)
-        output = self.cross_attn(output_query, x_latent).last_hidden_state
-        return self.output_adapter(output, **kwargs)
-
-class PerceiverIO(nn.Sequential):
-    def __init__(self, encoder: PerceiverEncoder, decoder: PerceiverDecoder):
-        super().__init__(encoder, decoder)
-```
-
-- Optical flow backend (dense queries via `x_adapted` and output reshape):
-
-```39:79:perceiver/model/vision/optical_flow/backend.py
-class OpticalFlowInputAdapter(InputAdapter):
-    ...
-    def forward(self, x):
+### Data and episode format
+Recommended JSON structure for episodic data:
+```json
+{
+  "puzzles": [
+    {
+      "examples": [
+        { "input": [[...17...], ...17...], "output": [[...17...], ...17...] },
         ...
-        x = self.linear(x)
-        x = rearrange(x, "b ... c -> b (...) c")
-        pos_enc = self.position_encoding(b)
-        return torch.cat([x, pos_enc], dim=-1)
-
-class OpticalFlowOutputAdapter(OutputAdapter):
+      ]
+    },
     ...
-    def forward(self, x):
-        x = self.linear(x) / self.rescale_factor
-        return rearrange(x, "b (h w) c -> b h w c", h=self.image_shape[0])
+  ]
+}
+```
+- Training sampler enforces each episode has at least K+1 examples.
+- Optional augmentations per episode:
+  - 90° rotations and flips
+  - Color-value permutation (bijection on [0..9])
+  - Crops/pads if you later generalize beyond 17×17
+
+
+### Tensor shapes (summary)
+- Base single-grid adapter (`GridInputAdapter`):
+  - Input grid `(B,H,W)` → `(B, H*W, C_base)`
+- Episodic adapter (`EpisodicGridInputAdapter`):
+  - Support input `(B,K,H,W)` → `(B, K*H*W, C_base + C_role + C_pair)`
+  - Support output `(B,K,H,W)` → `(B, K*H*W, C_base + C_role + C_pair)`
+  - Query input `(B,H,W)` → `(B, H*W, C_base + C_role + C_pair)`
+  - Concatenated episodic input: `(B, M_epi, C_epi)` with `M_epi = (2K+1)*H*W` and `C_epi = C_base + C_role + C_pair`
+- Encoder latents: `(B, N, D)`
+- Decoder queries (query-only adapter): `(B, H*W, C_query)`
+- Output logits: `(B, H, W, num_classes)`
+
+
+### How it fits existing code
+- Encoder/decoder are unchanged; we only supply:
+  - A new input adapter that understands episodic structure and returns a long concatenated sequence.
+  - A decoder query provider that uses query-only adapted tokens (same `GridQueryProvider` pattern used today).
+- The pattern matches the existing grid backend and optical-flow backend: decoder queries are derived from inputs while the encoder writes context into latents.
+
+
+### Training pipeline
+1) Dataloader
+   - Batch of episodes: collate lists of `(support_x, support_y, query_x, query_y)` to tensors:
+     - `support_x`: `(B,K,H,W)`
+     - `support_y`: `(B,K,H,W)`
+     - `query_x`: `(B,H,W)`
+     - `query_y`: `(B,H,W)`
+   - Optional per-episode random augmentation and color remapping.
+
+2) Forward
+   - `logits = model(support_x, support_y, query_x)` → `(B,H,W,num_classes)`
+
+3) Loss and metrics
+   - CE over flattened cells; per-cell and exact-grid accuracy.
+
+4) Optimization
+   - AdamW; consider cosine schedule with warmup; optional grad clipping (global norm or value clip).
+
+5) Checkpointing and logging
+   - Track best validation per-cell accuracy; also report exact-grid accuracy.
+   - Optionally dump per-episode predictions for visualization (as done in the single-grid trainer).
+
+
+### Minimal implementation plan
+Files to add (keeping modifications isolated):
+- `perceiver/model/grid/episodic.py`
+  - `EpisodicGridInputAdapter`
+    - Reuse components from `GridInputAdapter` (value embedding and Fourier position encoding).
+    - Add `nn.Embedding` for roles (size 3) and for pair indices (size `max_support`).
+    - Concatenate role and pair embeddings to each token.
+    - Forward accepts a struct (e.g., dict) with `support_in`, `support_out`, `query_in` and returns the concatenated sequence.
+  - `EpisodicGridPerceiverIO`
+    - Build encoder with `EpisodicGridInputAdapter`.
+    - Build a separate `GridInputAdapter` for query-only decoding.
+    - Use `GridQueryProvider` and `GridClassificationOutputAdapter` like the single-grid model, with `num_output_query_channels` from the query-only adapter.
+    - `forward(support_x, support_y, query_x)` encodes the episode; decodes from query-only adapted tokens.
+
+- `examples/training/grid/train_episodic.py`
+  - `EpisodicGridDataset` and training loop mirroring `examples/training/grid/train.py`, adapted to episode sampling.
+  - CLI: `--data`, `--episodes-per-epoch`, `--support-k`, `--batch-size`, `--lr`, `--epochs`, `--no-amp`, `--save-dir`, augmentation flags.
+
+Optional (later):
+- `perceiver/model/grid/__init__.py` export of the new backend class.
+
+
+### Hyperparameters and defaults
+- `K` (support size): 3
+- `num_latents` `N`: 17×17 (289) or smaller (e.g., 128) depending on budget
+- `num_latent_channels` `D`: 256–512
+- Heads/layers:
+  - Cross/self heads: 8–16
+  - Self-attn layers per block: 8–16
+  - Self-attn blocks: 4–16 (weight sharing can reduce params)
+- Dropout: 0.1–0.2
+- Embedding sizes:
+  - Value embedding: 32–64
+  - Positional Fourier bands: 16–32
+  - Role embedding: 8–16
+  - Pair embedding: 8–16
+
+
+### Ablations and variants
+- Where to put role/pair signals:
+  - Concatenate as channels (proposed), or add as bias via small MLP.
+  - Try shared vs separate value embeddings for inputs and outputs.
+  - Try omitting support outputs (use inputs-only memory) as a control.
+
+- Episode tokenization layout:
+  - Interleave per-pair `[x_i, y_i]` vs grouping all X then all Y. The per-pair interleave should aid locality; keep as default.
+
+- Query provider options:
+  - Use query-only adapter (proposed).
+  - Alternative: learned queries plus conditioning on query input via an additional encoder pass (heavier).
+
+- Few-shot size:
+  - Train with K∈{1,2,3} via sampling to improve robustness.
+
+- Augmentation:
+  - Study color remap and rotations to encourage permutation/rotation invariance.
+
+
+### Risks and mitigations
+- Latent capacity: When `M_epi = (2K+1) H W` grows, ensure `N` and `D` are sufficient. Mitigate with more self-attn depth and adequate `N` (≥ H*W is safe but expensive).
+- Leakage of query target: Ensure the episodic adapter never encodes `query_y` during training.
+- Overfitting to color indices: Use color permutation augmentation.
+- Memory: Use AMP, reduce `N`, `D`, or layers if OOM; consider gradient checkpointing already supported by core modules.
+
+
+### Milestones
+1) Backend and adapter
+   - Implement `EpisodicGridInputAdapter` and `EpisodicGridPerceiverIO`.
+   - Unit test on synthetic episodes (shape checks; forward pass).
+2) Training loop
+   - Implement `EpisodicGridDataset`, sampler, collate, augmentation.
+   - Train sanity-check runs; verify loss decreases; evaluate per-cell/exact-grid metrics.
+3) Evaluation/inference
+   - Script path to load support examples and predict for a withheld query input; JSON or image visualization.
+4) Ablations
+   - Toggle role/pair embeddings, K, and layout; track metrics.
+
+
+### Minimal surface changes (commit plan)
+- Add `perceiver/model/grid/episodic.py`
+- Add `examples/training/grid/train_episodic.py`
+- Optionally export from `perceiver/model/grid/__init__.py`
+- No edits to core modules are required.
+
+
+### API sketch (for reference)
+Episodic backend construction (defaults omitted):
+```python
+model = EpisodicGridPerceiverIO(
+    grid_shape=(17, 17),
+    num_classes=10,
+    max_support=5,   # for pair-index embeddings
+    # encoder/decoder hyperparams...
+)
+```
+Training step:
+```python
+logits = model(support_x, support_y, query_x)   # (B,H,W,C)
+loss = ce(logits.view(B*H*W, C), query_y.view(B*H*W))
 ```
 
-- Query provider pattern:
 
-```81:93:perceiver/model/vision/optical_flow/backend.py
-class OpticalFlowQueryProvider(nn.Module, QueryProvider):
-    ...
-    def forward(self, x):
-        assert x.shape[-1] == self.num_query_channels
-        return x
-```
-
-This grid-to-grid model mirrors the optical flow pattern with different input features and output heads (10-way classification per grid cell). With small architectural sizes and standard PyTorch training, it should be straightforward to implement and iterate. 
+### What success looks like
+- On held-out episodes, exact-grid accuracy for the query output significantly exceeds single-pair training baselines.
+- Robustness to color permutations and geometric transforms via augmentation.
+- Clean integration with existing Perceiver IO code paths; small, isolated code surface area.
 
 
