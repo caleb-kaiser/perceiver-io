@@ -157,15 +157,15 @@ def main():
     model = GridPerceiverIO(
         grid_shape=(17, 17),
         num_classes=10,
-        num_value_embeddings=10,
+        num_value_embeddings=30,
         value_embedding_dim=64,
         num_frequency_bands=32,
         num_latents=17*17,
-        num_latent_channels=256,
-        num_cross_attention_heads=8,
-        num_self_attention_heads=8,
-        num_self_attention_layers_per_block=8,
-        num_self_attention_blocks=8,
+        num_latent_channels=512,
+        num_cross_attention_heads=16,
+        num_self_attention_heads=16,
+        num_self_attention_layers_per_block=16,
+        num_self_attention_blocks=16,
         dropout=0.,
     ).to(device)
 
