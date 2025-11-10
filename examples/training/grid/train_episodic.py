@@ -80,11 +80,19 @@ def set_seed(seed: int):
 
 def accuracy_per_cell(logits: torch.Tensor, targets: torch.Tensor) -> float:
     preds = logits.argmax(dim=-1)
+    padding_mask = (targets != 10).long()
+    preds = preds * padding_mask
+    targets = targets * padding_mask
+
     return (preds == targets).float().mean().item()
 
 
 def accuracy_exact_grid(logits: torch.Tensor, targets: torch.Tensor) -> float:
     preds = logits.argmax(dim=-1)
+    padding_mask = (targets != 10).long()
+    preds = preds * padding_mask
+    targets = targets * padding_mask
+
     correct_grid = (preds == targets).all(dim=(1, 2)).float()
     return correct_grid.mean().item()
 
