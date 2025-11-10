@@ -50,7 +50,7 @@ class EpisodicGridDataset(Dataset):
             pad_h = self.h - gh
             pad_w = self.w - gw
             # pad format: (left, right, top, bottom)
-            return F.pad(g, (0, pad_w, 0, pad_h), value=0)
+            return F.pad(g, (0, pad_w, 0, pad_h), value=10)
 
         support_in = torch.stack(
             [pad_grid(torch.tensor(e.input, dtype=torch.long)) for e in examples], dim=0
@@ -209,7 +209,7 @@ def main():
 
     model = EpisodicGridPerceiverIO(
         grid_shape=target_shape,
-        num_classes=10,
+        num_classes=11,
         num_value_embeddings=30,
         value_embedding_dim=64,
         num_frequency_bands=32,
