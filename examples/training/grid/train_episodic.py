@@ -88,6 +88,20 @@ def accuracy_exact_grid(logits: torch.Tensor, targets: torch.Tensor) -> float:
     correct_grid = (preds == targets).all(dim=(1, 2)).float()
     return correct_grid.mean().item()
 
+def episodic_loss(pred, target, lambda_=5.0, threshold=0.9):
+    """Encourage full solutions rather than partial correctness."""
+    # Standard per-token CE
+    ce = F.cross_entropy(pred.permute(2,0,1).unsqueeze(0), target.unsqueeze(0).long())
+    
+    # Episode-level correctness
+    acc = (pred.argmax(-1) == target).float().mean()
+    
+    # Penalty if not near perfect
+    penalty = torch.relu(threshold - acc)
+    
+    return ce + lambda_ * penalty
+
+
 
 def load_episodic_data(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     with open(path, "r") as f:
@@ -244,8 +258,8 @@ def main():
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = nn.CrossEntropyLoss()
-
+    # loss_fn = nn.CrossEntropyLoss()
+    loss_fn = episodic_loss
     scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and not args.no_amp) else None
 
     os.makedirs(args.save_dir, exist_ok=True)
