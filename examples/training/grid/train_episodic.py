@@ -91,6 +91,7 @@ def accuracy_exact_grid(logits: torch.Tensor, targets: torch.Tensor) -> float:
 def episodic_loss(pred, target, lambda_=5.0, threshold=0.9):
     """Encourage full solutions rather than partial correctness."""
     # Standard per-token CE
+    print(pred.shape, target.shape)
     ce = F.cross_entropy(pred.permute(2,0,1).unsqueeze(0), target.unsqueeze(0).long())
     
     # Episode-level correctness
