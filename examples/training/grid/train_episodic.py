@@ -270,7 +270,7 @@ def main():
         num_self_attention_heads=16,
         num_self_attention_layers_per_block=8,
         num_self_attention_blocks=8,
-        dropout=0.15,
+        dropout=0.1,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -292,9 +292,10 @@ def main():
             f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
         )
 
-        # dump test predictions for later analysis
-        pred_path = os.path.join(args.save_dir, f"episodic_test_preds_epoch{epoch:03d}.json")
-        dump_test_predictions(model, test_dl, device, pred_path)
+        if epoch % 10 == 0:
+            # dump test predictions for later analysis
+            pred_path = os.path.join(args.save_dir, f"episodic_test_preds_epoch{epoch:03d}.json")
+            dump_test_predictions(model, test_dl, device, pred_path)
 
         if val_acc_cell > best_val_acc:
             best_val_acc = val_acc_cell
