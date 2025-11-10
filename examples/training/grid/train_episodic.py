@@ -88,11 +88,19 @@ def accuracy_exact_grid(logits: torch.Tensor, targets: torch.Tensor) -> float:
     correct_grid = (preds == targets).all(dim=(1, 2)).float()
     return correct_grid.mean().item()
 
+def make_loss_mask(target: torch.Tensor) -> torch.Tensor:
+    mask = (target != 10).float()
+    inv = (target == 10).float() * 0.2 # 20% credit for padding cells
+    return mask + inv
+
+
 def episodic_loss(pred, target, lambda_=5.0, threshold=0.9):
     """Encourage full solutions rather than partial correctness."""
     # Standard per-token CE
     #ce = F.cross_entropy(pred.permute(2,0,1).unsqueeze(0), target.unsqueeze(0).long())
-    ce = F.cross_entropy(pred, target)
+    ce = F.cross_entropy(pred, target, reduction="none")
+    mask = make_loss_mask(target)
+    ce = (ce * mask).sum() / mask.sum()
     # Episode-level correctness
     acc = (pred.argmax(-1) == target).float().mean()
     
