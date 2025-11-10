@@ -265,11 +265,11 @@ def main():
         pair_embedding_dim=16,
         max_support=max(5, args.support_k),
         num_latents=30 * 30,
-        num_latent_channels=512,
-        num_cross_attention_heads=16,
-        num_self_attention_heads=16,
+        num_latent_channels=256,
+        num_cross_attention_heads=8,
+        num_self_attention_heads=8,
         num_self_attention_layers_per_block=8,
-        num_self_attention_blocks=8,
+        num_self_attention_blocks=2,
         dropout=0.1,
     ).to(device)
 
