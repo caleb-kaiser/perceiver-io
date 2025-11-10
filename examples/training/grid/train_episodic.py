@@ -7,50 +7,65 @@ from typing import Any, Dict, List, Tuple
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 from perceiver.model.grid.episodic import EpisodicGridPerceiverIO
+from dataclasses import dataclass
+from arc_agi_dataloader import GridSample, EpisodicGridSample, load_dataset
+from tqdm import tqdm
 
 
 class EpisodicGridDataset(Dataset):
-    def __init__(self, puzzles: List[Dict[str, Any]], grid_shape: Tuple[int, int] = (17, 17), support_k: int = 3):
+    def __init__(self, puzzles: List[EpisodicGridSample], grid_shape: Tuple[int, int] = (30, 30), support_k: int = 3):
         super().__init__()
         self.h, self.w = grid_shape
         self.support_k = support_k
 
-        # Filter puzzles with at least support_k + 1 examples
-        self.samples: List[List[Dict[str, List[List[int]]]]] = []
+        # Filter puzzles with at least support_k examples
+        self.samples: List[EpisodicGridSample] = []
         for p in puzzles:
-            examples = p.get("examples", [])
-            if len(examples) >= support_k + 1:
-                self.samples.append(examples)
+            if len(p.train) >= support_k:
+                self.samples.append(p)
         if len(self.samples) == 0:
-            raise ValueError("No puzzles with enough examples (>= support_k + 1) found in dataset.")
+            raise ValueError("No puzzles with enough examples (>= support_k) found in dataset.")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        exs = self.samples[idx]
-        # Randomly choose K+1 distinct indices
-        indices = random.sample(range(len(exs)), self.support_k + 1)
-        support_idx = indices[:-1]
-        query_idx = indices[-1]
+        puzzle = self.samples[idx]
 
-        # Build tensors
+        examples = puzzle.train
+
+        if len(examples) > self.support_k:
+            examples = random.sample(examples, self.support_k)
+
+        target = puzzle.test[0] # Test is a list of one sample
+
+        def pad_grid(g: torch.Tensor) -> torch.Tensor:
+            # g: (h, w) -> pad bottom/right to (self.h, self.w) with zeros
+            gh, gw = g.shape
+            if gh > self.h or gw > self.w:
+                raise ValueError(f"Grid larger than target padding size: got {(gh, gw)}, target {(self.h, self.w)}")
+            pad_h = self.h - gh
+            pad_w = self.w - gw
+            # pad format: (left, right, top, bottom)
+            return F.pad(g, (0, pad_w, 0, pad_h), value=0)
+
         support_in = torch.stack(
-            [torch.tensor(exs[i]["input"], dtype=torch.long) for i in support_idx], dim=0
-        )  # (k, h, w)
+            [pad_grid(torch.tensor(e.input, dtype=torch.long)) for e in examples], dim=0
+        )  # (k, H, W)
         support_out = torch.stack(
-            [torch.tensor(exs[i]["output"], dtype=torch.long) for i in support_idx], dim=0
-        )  # (k, h, w)
-        query_in = torch.tensor(exs[query_idx]["input"], dtype=torch.long)  # (h, w)
-        query_out = torch.tensor(exs[query_idx]["output"], dtype=torch.long)  # (h, w)
+            [pad_grid(torch.tensor(e.output, dtype=torch.long)) for e in examples], dim=0
+        )  # (k, H, W)
+        query_in = pad_grid(torch.tensor(target.input, dtype=torch.long))   # (H, W)
+        query_out = pad_grid(torch.tensor(target.output, dtype=torch.long)) # (H, W)
 
         # Sanity checks
         if support_in.shape[1:] != (self.h, self.w) or support_out.shape[1:] != (self.h, self.w):
-            raise ValueError("Support sample shapes do not match expected grid_shape.")
+            raise ValueError("Support samples not padded correctly to target grid_shape.")
         if query_in.shape != (self.h, self.w) or query_out.shape != (self.h, self.w):
-            raise ValueError("Query sample shapes do not match expected grid_shape.")
+            raise ValueError("Query samples not padded correctly to target grid_shape.")
 
         return support_in, support_out, query_in, query_out
 
@@ -105,7 +120,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None):
 
     autocast = torch.cuda.amp.autocast if scaler is not None else torch.cpu.amp.autocast
 
-    for s_in, s_out, q_in, q_out in dataloader:
+    for s_in, s_out, q_in, q_out in tqdm(dataloader):
         s_in = s_in.to(device)     # (b,k,h,w)
         s_out = s_out.to(device)   # (b,k,h,w)
         q_in = q_in.to(device)     # (b,h,w)
@@ -163,7 +178,7 @@ def eval_epoch(model, dataloader, loss_fn, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True, help="Path to episodic JSON data with 'puzzles'.")
+    parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -177,16 +192,23 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_puzzles, test_puzzles = load_episodic_data(args.data)
-
-    train_ds = EpisodicGridDataset(train_puzzles, grid_shape=(17, 17), support_k=args.support_k)
-    test_ds = EpisodicGridDataset(test_puzzles if len(test_puzzles) > 0 else train_puzzles, grid_shape=(17, 17), support_k=args.support_k)
+    if args.data is None:
+        train_puzzles = load_dataset()
+        test_puzzles = load_dataset(split="evaluation")
+    else:
+        train_puzzles = load_dataset(args.data)
+        test_puzzles = load_dataset(args.data, split="evaluation")
+    
+    # Pad to max grid size 30x30
+    target_shape = (30, 30)
+    train_ds = EpisodicGridDataset(train_puzzles, grid_shape=target_shape, support_k=args.support_k)
+    test_ds = EpisodicGridDataset(test_puzzles if len(test_puzzles) > 0 else train_puzzles, grid_shape=target_shape, support_k=args.support_k)
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
     test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     model = EpisodicGridPerceiverIO(
-        grid_shape=(17, 17),
+        grid_shape=target_shape,
         num_classes=10,
         num_value_embeddings=30,
         value_embedding_dim=64,
@@ -194,7 +216,7 @@ def main():
         role_embedding_dim=16,
         pair_embedding_dim=16,
         max_support=max(5, args.support_k),
-        num_latents=17 * 17,
+        num_latents=30 * 30,
         num_latent_channels=512,
         num_cross_attention_heads=16,
         num_self_attention_heads=16,
