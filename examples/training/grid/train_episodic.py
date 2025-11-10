@@ -102,7 +102,7 @@ def make_loss_mask(target: torch.Tensor) -> torch.Tensor:
     return mask + inv
 
 
-def episodic_loss(pred, target, lambda_=5.0, threshold=0.9):
+def episodic_loss(pred, target, lambda_=5.0, threshold=0.9, temperature=1.0):
     """Encourage full solutions rather than partial correctness."""
     # Standard per-token CE
     #ce = F.cross_entropy(pred.permute(2,0,1).unsqueeze(0), target.unsqueeze(0).long())
@@ -114,35 +114,13 @@ def episodic_loss(pred, target, lambda_=5.0, threshold=0.9):
     
     # Penalty if not near perfect
     penalty = torch.relu(threshold - acc)
-    
-    return ce + lambda_ * penalty
+    score = -ce.detach() + acc
+    weight = torch.exp(score / temperature)
+    loss = weight * (ce + lambda_ * penalty)
 
+    return loss, ce.item(), acc.item(), weight.item()
 
-
-def load_episodic_data(path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    with open(path, "r") as f:
-        data = json.load(f)
-    train = data.get("train", None)
-    test = data.get("test", None)
-    # Support two layouts:
-    # - {"train": {"puzzles": [...]}, "test": {"puzzles": [...]}}
-    # - {"puzzles": [...]} (use same for train/test if only one split is provided)
-    def get_puzzles(split):
-        if split is None:
-            return None
-        if isinstance(split, dict) and "puzzles" in split:
-            return split["puzzles"]
-        # Backward-compat: if user provided a single key "puzzles" at top-level
-        if isinstance(split, list):
-            return split
-        return None
-
-    train_puzzles = get_puzzles(train) or data.get("puzzles", [])
-    test_puzzles = get_puzzles(test) or []
-    return train_puzzles, test_puzzles
-
-
-def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None):
+def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temperature=1.0):
     model.train()
     running_loss = 0.0
     running_acc = 0.0
@@ -161,7 +139,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None):
         with autocast():
             logits = model(s_in, s_out, q_in)  # (b,h,w,c)
             b, h, w, c = logits.shape
-            loss = loss_fn(logits.view(b * h * w, c), q_out.view(b * h * w))
+            loss, ce_val, acc, w = loss_fn(logits.view(b * h * w, c), q_out.view(b * h * w))
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -180,7 +158,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None):
 
 
 @torch.no_grad()
-def eval_epoch(model, dataloader, loss_fn, device):
+def eval_epoch(model, dataloader, loss_fn, device, temperature=1.0):
     model.eval()
     running_loss = 0.0
     running_acc_cell = 0.0
@@ -195,7 +173,7 @@ def eval_epoch(model, dataloader, loss_fn, device):
 
         logits = model(s_in, s_out, q_in)
         b, h, w, c = logits.shape
-        loss = loss_fn(logits.view(b * h * w, c), q_out.view(b * h * w))
+        loss, ce_val, acc, w = loss_fn(logits.view(b * h * w, c), q_out.view(b * h * w))
 
         running_loss += loss.item()
         running_acc_cell += accuracy_per_cell(logits, q_out)
@@ -229,7 +207,7 @@ def main():
     parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-dir", type=str, default="checkpoints")
@@ -270,7 +248,7 @@ def main():
         num_self_attention_heads=8,
         num_self_attention_layers_per_block=8,
         num_self_attention_blocks=2,
-        dropout=0.1,
+        dropout=0.15,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -282,9 +260,18 @@ def main():
     best_val_acc = 0.0
     best_path = None
 
+    temperature = 1.0
+
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_epoch(model, train_dl, optimizer, loss_fn, device, scaler=scaler)
-        val_loss, val_acc_cell, val_acc_grid = eval_epoch(model, test_dl, loss_fn, device)
+        if 4 < epoch < 15:
+            temperature = 0.3
+        elif epoch >= 15:
+            temperature = 0.1
+        elif epoch >= 30:
+            temperature = 0.05
+
+        train_loss, train_acc = train_epoch(model, train_dl, optimizer, loss_fn, device, scaler=scaler, temperature=temperature)
+        val_loss, val_acc_cell, val_acc_grid = eval_epoch(model, test_dl, loss_fn, device, temperature=temperature)
 
         print(
             f"[Episodic] Epoch {epoch:03d} | "
