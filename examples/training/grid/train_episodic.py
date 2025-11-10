@@ -176,6 +176,24 @@ def eval_epoch(model, dataloader, loss_fn, device):
     return running_loss / denom, running_acc_cell / denom, running_acc_grid / denom
 
 
+@torch.no_grad()
+def dump_test_predictions(model, dataloader, device, out_path: str):
+    model.eval()
+    results = []
+    for s_in, s_out, q_in, q_out in dataloader:
+        s_in = s_in.to(device)
+        s_out = s_out.to(device)
+        q_in = q_in.to(device)
+        q_out = q_out.to(device)
+        logits = model(s_in, s_out, q_in)  # (b, h, w, c)
+        preds = logits.argmax(dim=-1).cpu()  # (b, h, w)
+        targets = q_out.cpu()  # (b, h, w)
+        for p, t in zip(preds, targets):
+            results.append({"pred": p.tolist(), "target": t.tolist()})
+    with open(out_path, "w") as f:
+        json.dump({"samples": results}, f)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default=None)
@@ -243,6 +261,10 @@ def main():
             f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} | "
             f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
         )
+
+        # dump test predictions for later analysis
+        pred_path = os.path.join(args.save_dir, f"episodic_test_preds_epoch{epoch:03d}.json")
+        dump_test_predictions(model, test_dl, device, pred_path)
 
         if val_acc_cell > best_val_acc:
             best_val_acc = val_acc_cell
