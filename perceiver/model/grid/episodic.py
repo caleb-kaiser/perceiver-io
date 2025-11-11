@@ -129,7 +129,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         num_self_attention_heads: int = 4,
         num_self_attention_layers_per_block: int = 4,
         num_self_attention_blocks: int = 1,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         activation_checkpointing: bool = False,
         activation_offloading: bool = False,
         # ACT (Adaptive Computation Time)
@@ -170,7 +170,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
             num_self_attention_v_channels=None,
             num_self_attention_layers_per_block=num_self_attention_layers_per_block,
             num_self_attention_blocks=num_self_attention_blocks,
-            dropout=dropout,
+            #dropout=dropout,
             activation_checkpointing=activation_checkpointing,
             activation_offloading=activation_offloading,
         )
@@ -188,7 +188,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
             num_cross_attention_heads=num_cross_attention_heads,
             num_cross_attention_qk_channels=num_latent_channels,
             num_cross_attention_v_channels=num_latent_channels,
-            dropout=dropout,
+            #dropout=dropout,
             activation_checkpointing=activation_checkpointing,
             activation_offloading=activation_offloading,
         )

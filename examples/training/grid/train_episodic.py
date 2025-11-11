@@ -17,6 +17,8 @@ from arc_agi_dataloader import GridSample, EpisodicGridSample, load_dataset
 from tqdm import tqdm
 
 from adam_atan2_pytorch import AdamAtan2
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 class WarmupCosineLRLambda:
@@ -228,7 +230,19 @@ def eval_epoch(model, dataloader, loss_fn, device, temperature=1.0):
         num_batches += 1
 
     denom = max(1, num_batches)
-    return running_loss / denom, running_acc_cell / denom, running_acc_grid / denom
+    loss_avg = running_loss / denom
+    acc_cell_avg = running_acc_cell / denom
+    acc_grid_avg = running_acc_grid / denom
+
+    # If distributed, average metrics across processes
+    if dist.is_available() and dist.is_initialized():
+        t = torch.tensor([loss_avg, acc_cell_avg, acc_grid_avg], device=device, dtype=torch.float32)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        world = dist.get_world_size()
+        t = t / world
+        loss_avg, acc_cell_avg, acc_grid_avg = t.tolist()
+
+    return loss_avg, acc_cell_avg, acc_grid_avg
 
 
 @torch.no_grad()
@@ -337,7 +351,7 @@ def dump_debug_images(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default=None)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -349,18 +363,42 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--min-lr-scale", type=float, default=0.0, help="Minimum LR as scale*base_lr at schedule end")
+    # Distributed options (auto-detected when using torchrun)
+    parser.add_argument("--dist-backend", type=str, default="nccl")
     # ACT options
     parser.add_argument("--act-enabled", action="store_true")
-    parser.add_argument("--act-max-steps", type=int, default=None)
-    parser.add_argument("--act-threshold", type=float, default=0.99)
+    parser.add_argument("--act-max-steps", type=int, default=100)
+    parser.add_argument("--act-threshold", type=float, default=0.9)
     parser.add_argument("--act-epsilon", type=float, default=1e-2)
-    parser.add_argument("--act-min-steps", type=int, default=1)
+    parser.add_argument("--act-min-steps", type=int, default=18)
     parser.add_argument("--act-temperature", type=float, default=1.0)
     parser.add_argument("--act-ponder-cost", type=float, default=1e-3)
     args = parser.parse_args()
 
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Distributed initialization (torchrun/populated envs)
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = local_rank != -1 and world_size > 1
+
+    if is_distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=args.dist-backend if torch.cuda.is_available() else "gloo")
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Utilities for DDP
+    def is_main_process() -> bool:
+        return (not is_distributed) or dist.get_rank() == 0
+
+    def get_model_attr(m, name, default=None):
+        if hasattr(m, name):
+            return getattr(m, name)
+        if hasattr(m, "module") and hasattr(m.module, name):
+            return getattr(m.module, name)
+        return default
+
+    set_seed(args.seed + (dist.get_rank() if is_distributed else 0))
 
     if args.data is None:
         train_puzzles = load_dataset()
@@ -374,8 +412,29 @@ def main():
     train_ds = EpisodicGridDataset(train_puzzles, grid_shape=target_shape, support_k=args.support_k)
     test_ds = EpisodicGridDataset(test_puzzles if len(test_puzzles) > 0 else train_puzzles, grid_shape=target_shape, support_k=args.support_k)
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    # Samplers for DDP
+    train_sampler = None
+    test_sampler = None
+    if is_distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_ds, shuffle=True, drop_last=False)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_ds, shuffle=False, drop_last=False)
+
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=2,
+        pin_memory=True,
+    )
+    test_dl = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=2,
+        pin_memory=True,
+    )
 
     model = EpisodicGridPerceiverIO(
         grid_shape=target_shape,
@@ -388,11 +447,10 @@ def main():
         max_support=max(5, args.support_k),
         num_latents=30 * 30,
         num_latent_channels=512,
-        num_cross_attention_heads=8,
-        num_self_attention_heads=8,
-        num_self_attention_layers_per_block=8,
-        num_self_attention_blocks=8,
-        dropout=0.1,
+        num_cross_attention_heads=4,
+        num_self_attention_heads=4,
+        num_self_attention_layers_per_block=1,
+        num_self_attention_blocks=2,
         act_enabled=args.act_enabled,
         act_max_steps=args.act_max_steps,
         act_threshold=args.act_threshold,
@@ -401,7 +459,11 @@ def main():
         act_temperature=args.act_temperature,
     ).to(device)
 
-    optimizer = AdamAtan2(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+    # Wrap with DDP
+    if is_distributed:
+        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None, output_device=device.index if device.type == "cuda" else None, find_unused_parameters=False)
+
+    optimizer = AdamAtan2(getattr(model, "module", model).parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     # loss_fn = nn.CrossEntropyLoss()
     loss_fn = episodic_loss
     scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and not args.no_amp) else None
@@ -422,6 +484,9 @@ def main():
     temperature = 1.0
 
     for epoch in range(1, args.epochs + 1):
+        # Set epoch on sampler for shuffling
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         #if 4 < epoch < 15:
         #    temperature = 0.3
         #elif epoch >= 15:
@@ -442,53 +507,53 @@ def main():
         )
         
         # Add ponder loss if ACT is enabled (computed on-the-fly from model stats)
-        if getattr(model, "act_enabled", False):
+        if get_model_attr(model, "act_enabled", False):
             # Re-run logging averages over last epoch via stored stats inside training loop if available
             # Note: We compute ponder on each batch during training for correctness; here we just read stats for logging.
             pass
 
         val_loss, val_acc_cell, val_acc_grid = eval_epoch(model, test_dl, loss_fn, device, temperature=temperature)
 
-        print(
-            f"[Episodic] Epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} train_acc_grid={train_acc_grid:.4f} | "
-            f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
-        )
-        # Report current LR (first param group)
-        try:
-            cur_lr = optimizer.param_groups[0]["lr"]
-            print(f"[LR] lr={cur_lr:.6e} (warmup_steps={warmup_steps}, total_steps={total_steps}, min_scale={args.min_lr_scale})")
-        except Exception:
-            pass
-        # Optionally report ACT stats
-        if getattr(model, "act_enabled", False) and hasattr(model, "_last_act_epoch_stats"):
-            stats = model._last_act_epoch_stats
-            mean_steps = stats.get("mean_expected_steps", None)
+        if is_main_process():
+            print(
+                f"[Episodic] Epoch {epoch:03d} | "
+                f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} train_acc_grid={train_acc_grid:.4f} | "
+                f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
+            )
+            # Report current LR (first param group)
+            try:
+                cur_lr = optimizer.param_groups[0]["lr"]
+                print(f"[LR] lr={cur_lr:.6e} (warmup_steps={warmup_steps}, total_steps={total_steps}, min_scale={args.min_lr_scale})")
+            except Exception:
+                pass
+            # Optionally report ACT stats
+            last_stats = get_model_attr(model, "_last_act_epoch_stats", {})
+            mean_steps = last_stats.get("mean_expected_steps", None) if isinstance(last_stats, dict) else None
             if mean_steps is not None:
                 print(f"[Episodic][ACT] mean_expected_steps={mean_steps:.3f} (ponder_cost={args.act_ponder_cost})")
 
-        if epoch % 10 == 0:
+        if is_main_process() and epoch % 100 == 0:
             # dump test predictions for later analysis
             pred_path = os.path.join(args.save_dir, f"episodic_test_preds_epoch{epoch:03d}.json")
             dump_test_predictions(model, test_dl, device, pred_path)
-            # dump debug images (every 10th batch, capped)
+            # dump debug images (every 100th batch, capped)
             img_dir = os.path.join(args.save_dir, f"episodic_vis_epoch{epoch:03d}")
             dump_debug_images(
                 model,
                 test_dl,
                 device,
                 img_dir,
-                save_every_batches=10,
+                save_every_batches=100,
                 max_batches=20,
                 max_support_pairs=min(3, args.support_k),
             )
 
-        if val_acc_cell > best_val_acc:
+        if is_main_process() and val_acc_cell > best_val_acc:
             best_val_acc = val_acc_cell
             best_path = os.path.join(args.save_dir, f"episodic-gridio-epoch{epoch:03d}-acc{best_val_acc:.3f}.pt")
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": getattr(model, "module", model).state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch,
                     "val_acc_cell": best_val_acc,
@@ -496,7 +561,7 @@ def main():
                 best_path,
             )
 
-    if best_path is not None:
+    if is_main_process() and best_path is not None:
         print(f"Best checkpoint: {best_path}")
 
 
