@@ -382,7 +382,7 @@ def main():
 
     if is_distributed:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=args.dist-backend if torch.cuda.is_available() else "gloo")
+        dist.init_process_group(backend=args.dist_backend if torch.cuda.is_available() else "gloo")
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -567,3 +567,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
