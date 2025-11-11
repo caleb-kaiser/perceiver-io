@@ -363,7 +363,7 @@ def main():
         num_cross_attention_heads=8,
         num_self_attention_heads=8,
         num_self_attention_layers_per_block=8,
-        num_self_attention_blocks=16,
+        num_self_attention_blocks=8,
         dropout=0.1,
         act_enabled=args.act_enabled,
         act_max_steps=args.act_max_steps,
@@ -385,12 +385,14 @@ def main():
     temperature = 1.0
 
     for epoch in range(1, args.epochs + 1):
-        if 4 < epoch < 15:
-            temperature = 0.3
-        elif epoch >= 15:
-            temperature = 0.1
-        elif epoch >= 30:
-            temperature = 0.05
+        if epoch > 1:
+            temperature = 0.01
+        #if 4 < epoch < 15:
+        #    temperature = 0.3
+        #elif epoch >= 15:
+        #    temperature = 0.1
+        #elif epoch >= 30:
+        #    temperature = 0.05
 
         train_loss, train_acc, train_acc_grid = train_epoch(
             model,
