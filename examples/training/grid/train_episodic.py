@@ -19,6 +19,24 @@ from tqdm import tqdm
 from adam_atan2_pytorch import AdamAtan2
 
 
+class WarmupCosineLRLambda:
+    def __init__(self, total_steps: int, warmup_steps: int, min_lr_scale: float):
+        self.total_steps = max(1, int(total_steps))
+        self.warmup_steps = max(0, int(min(warmup_steps, self.total_steps)))
+        self.min_lr_scale = float(min_lr_scale)
+
+    def __call__(self, step: int) -> float:
+        if self.total_steps <= 0:
+            return 1.0
+        if step < self.warmup_steps:
+            warmup_frac = step / max(1, self.warmup_steps)
+            return self.min_lr_scale + (1.0 - self.min_lr_scale) * warmup_frac
+        progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr_scale + (1.0 - self.min_lr_scale) * cosine
+
+
 class EpisodicGridDataset(Dataset):
     def __init__(self, puzzles: List[EpisodicGridSample], grid_shape: Tuple[int, int] = (30, 30), support_k: int = 3):
         super().__init__()
@@ -124,7 +142,7 @@ def episodic_loss(pred, target, lambda_=5.0, threshold=0.9, temperature=1.0):
 
     return loss, ce.item(), acc.item(), weight.item()
 
-def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temperature=1.0, ponder_cost: float = 0.0):
+def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temperature=1.0, ponder_cost: float = 0.0, scheduler=None):
     model.train()
     running_loss = 0.0
     running_acc = 0.0
@@ -167,12 +185,9 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
         else:
             loss.backward()
             optimizer.step()
-        # Per-step LR scheduler (if attached to optimizer)
-        if getattr(optimizer, "param_groups", None) is not None:
-            for group in optimizer.param_groups:
-                scheduler = group.get("scheduler", None)
-                if scheduler is not None:
-                    scheduler.step()
+        # Per-step LR scheduler
+        if scheduler is not None:
+            scheduler.step()
 
         running_loss += loss.item()
         running_acc += accuracy_per_cell(logits.detach(), q_out)
@@ -397,21 +412,8 @@ def main():
     total_steps = args.total_steps if args.total_steps is not None else computed_total_steps
     warmup_steps = max(0, min(args.warmup_steps, total_steps))
 
-    def lr_lambda(step: int):
-        if total_steps <= 0:
-            return 1.0
-        if step < warmup_steps:
-            warmup_frac = step / max(1, warmup_steps)
-            return args.min_lr_scale + (1.0 - args.min_lr_scale) * warmup_frac
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        progress = min(max(progress, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return args.min_lr_scale + (1.0 - args.min_lr_scale) * cosine
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    # Attach scheduler handle to param_groups so train loop can step it without extra args
-    for group in optimizer.param_groups:
-        group["scheduler"] = scheduler
+    lr_lambda_obj = WarmupCosineLRLambda(total_steps=total_steps, warmup_steps=warmup_steps, min_lr_scale=args.min_lr_scale)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda_obj)
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_acc = 0.0
@@ -436,6 +438,7 @@ def main():
             scaler=scaler,
             temperature=temperature,
             ponder_cost=args.act_ponder_cost if args.act_enabled else 0.0,
+            scheduler=scheduler,
         )
         
         # Add ponder loss if ACT is enabled (computed on-the-fly from model stats)
@@ -499,7 +502,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
