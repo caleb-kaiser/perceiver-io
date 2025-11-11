@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from torchvision.utils import save_image, make_grid
 
 from perceiver.model.grid.episodic import EpisodicGridPerceiverIO
 from dataclasses import dataclass
@@ -224,6 +225,91 @@ def dump_test_predictions(model, dataloader, device, out_path: str):
         json.dump({"samples": results}, f)
 
 
+@torch.no_grad()
+def dump_debug_images(
+    model,
+    dataloader,
+    device,
+    out_dir: str,
+    save_every_batches: int = 10,
+    max_batches: int = 50,
+    max_support_pairs: int = 3,
+):
+    """
+    Saves composite PNGs showing:
+      - up to max_support_pairs support input/output pairs
+      - query input
+      - model prediction
+      - target output
+    Saves for every `save_every_batches`-th batch, up to `max_batches` total batches.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+
+    # Distinct palette for up to 11 classes (0..10), including padding (10)
+    palette = torch.tensor(
+        [
+            [0, 0, 0],        # 0 - black
+            [220, 20, 60],    # 1 - crimson
+            [65, 105, 225],   # 2 - royal blue
+            [34, 139, 34],    # 3 - forest green
+            [255, 140, 0],    # 4 - dark orange
+            [148, 0, 211],    # 5 - dark violet
+            [255, 215, 0],    # 6 - gold
+            [70, 130, 180],   # 7 - steel blue
+            [199, 21, 133],   # 8 - medium violet red
+            [139, 69, 19],    # 9 - saddle brown
+            [211, 211, 211],  # 10 - light gray (padding)
+        ],
+        dtype=torch.float32,
+        device=device,
+    ) / 255.0  # (11,3)
+
+    def grid_to_rgb(grid_hw: torch.Tensor) -> torch.Tensor:
+        # grid_hw: (H, W) long
+        color = palette[grid_hw.clamp(0, palette.size(0) - 1)]  # (H, W, 3)
+        return color.permute(2, 0, 1)  # (3, H, W)
+
+    batch_idx = 0
+    saved_batches = 0
+    for s_in, s_out, q_in, q_out in dataloader:
+        if batch_idx % max(1, save_every_batches) != 0:
+            batch_idx += 1
+            continue
+        if saved_batches >= max_batches:
+            break
+
+        s_in = s_in.to(device)   # (b,k,h,w)
+        s_out = s_out.to(device) # (b,k,h,w)
+        q_in = q_in.to(device)   # (b,h,w)
+        q_out = q_out.to(device) # (b,h,w)
+
+        logits = model(s_in, s_out, q_in)  # (b,h,w,c)
+        preds = logits.argmax(dim=-1)      # (b,h,w)
+
+        b, k, h, w = s_in.shape
+        k_show = min(k, max_support_pairs)
+
+        for i in range(b):
+            tiles = []
+            # Support inputs
+            for j in range(k_show):
+                tiles.append(grid_to_rgb(s_in[i, j]))
+                tiles.append(grid_to_rgb(s_out[i, j]))
+            # Query, Pred, Target
+            tiles.append(grid_to_rgb(q_in[i]))
+            tiles.append(grid_to_rgb(preds[i]))
+            tiles.append(grid_to_rgb(q_out[i]))
+
+            nrow = 2 * k_show + 3 if k_show > 0 else 3
+            grid_img = make_grid(tiles, nrow=nrow, padding=2)
+            save_path = os.path.join(out_dir, f"batch{batch_idx:04d}_sample{i:02d}.png")
+            save_image(grid_img, save_path)
+
+        batch_idx += 1
+        saved_batches += 1
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default=None)
@@ -316,6 +402,7 @@ def main():
             temperature=temperature,
             ponder_cost=args.act_ponder_cost if args.act_enabled else 0.0,
         )
+        
         # Add ponder loss if ACT is enabled (computed on-the-fly from model stats)
         if getattr(model, "act_enabled", False):
             # Re-run logging averages over last epoch via stored stats inside training loop if available
@@ -340,6 +427,17 @@ def main():
             # dump test predictions for later analysis
             pred_path = os.path.join(args.save_dir, f"episodic_test_preds_epoch{epoch:03d}.json")
             dump_test_predictions(model, test_dl, device, pred_path)
+            # dump debug images (every 10th batch, capped)
+            img_dir = os.path.join(args.save_dir, f"episodic_vis_epoch{epoch:03d}")
+            dump_debug_images(
+                model,
+                test_dl,
+                device,
+                img_dir,
+                save_every_batches=10,
+                max_batches=20,
+                max_support_pairs=min(3, args.support_k),
+            )
 
         if val_acc_cell > best_val_acc:
             best_val_acc = val_acc_cell

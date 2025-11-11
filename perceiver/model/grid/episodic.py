@@ -294,11 +294,16 @@ class EpisodicGridPerceiverIO(PerceiverIO):
                 halted_logits = halted_logits / float(temperature)
             p_t = torch.sigmoid(halted_logits).to(torch.float32)  # (B,)
 
+
+            halted_mask = torch.where(halting_acc >= threshold, 1.0, 0.0)
+            # Exploration
+            exploration = torch.rand_like(p_t) * halted_mask
             # Active mask
-            m_active = (halting_acc < threshold).to(torch.float32)  # (B,)
+            m_active = (exploration < p_t).to(torch.float32)  # (B,)
+
             remaining = (1.0 - halting_acc)  # (B,)
             # How much mass to take this step
-            new_mass = torch.minimum(p_t, remaining)
+            new_mass = torch.minimum(exploration, remaining)
             # If we cross threshold this step, take the remainder
             weight_t = torch.where(halting_acc + p_t >= threshold, remaining, new_mass)  # (B,)
             weight_t = weight_t * m_active
