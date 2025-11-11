@@ -501,3 +501,7 @@ if __name__ == "__main__":
     main()
 
 
+
+
+    python examples/training/grid/train_episodic.py \
+      --data ../ARC-AGI/data --epochs 100--act-enabled --act-max-steps 100 --batch-size 6 --lr 1e-4 --warmup-steps 2000 --min-lr-scale 0.1
