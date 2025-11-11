@@ -5,6 +5,7 @@ import random
 from typing import Any, Dict, List, Tuple
 
 import torch
+import math
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
@@ -14,6 +15,8 @@ from perceiver.model.grid.episodic import EpisodicGridPerceiverIO
 from dataclasses import dataclass
 from arc_agi_dataloader import GridSample, EpisodicGridSample, load_dataset
 from tqdm import tqdm
+
+from adam_atan2_pytorch import AdamAtan2
 
 
 class EpisodicGridDataset(Dataset):
@@ -164,6 +167,12 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
         else:
             loss.backward()
             optimizer.step()
+        # Per-step LR scheduler (if attached to optimizer)
+        if getattr(optimizer, "param_groups", None) is not None:
+            for group in optimizer.param_groups:
+                scheduler = group.get("scheduler", None)
+                if scheduler is not None:
+                    scheduler.step()
 
         running_loss += loss.item()
         running_acc += accuracy_per_cell(logits.detach(), q_out)
@@ -321,6 +330,10 @@ def main():
     parser.add_argument("--save-dir", type=str, default="checkpoints")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--support-k", type=int, default=3)
+    # Scheduler options
+    parser.add_argument("--warmup-steps", type=int, default=200)
+    parser.add_argument("--total-steps", type=int, default=None)
+    parser.add_argument("--min-lr-scale", type=float, default=0.0, help="Minimum LR as scale*base_lr at schedule end")
     # ACT options
     parser.add_argument("--act-enabled", action="store_true")
     parser.add_argument("--act-max-steps", type=int, default=None)
@@ -373,10 +386,32 @@ def main():
         act_temperature=args.act_temperature,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamAtan2(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     # loss_fn = nn.CrossEntropyLoss()
     loss_fn = episodic_loss
     scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and not args.no_amp) else None
+
+    # Create cosine scheduler with warmup (per-step). Attach to optimizer param_groups for minimal plumbing.
+    steps_per_epoch = len(train_dl)
+    computed_total_steps = args.epochs * steps_per_epoch
+    total_steps = args.total_steps if args.total_steps is not None else computed_total_steps
+    warmup_steps = max(0, min(args.warmup_steps, total_steps))
+
+    def lr_lambda(step: int):
+        if total_steps <= 0:
+            return 1.0
+        if step < warmup_steps:
+            warmup_frac = step / max(1, warmup_steps)
+            return args.min_lr_scale + (1.0 - args.min_lr_scale) * warmup_frac
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.min_lr_scale + (1.0 - args.min_lr_scale) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    # Attach scheduler handle to param_groups so train loop can step it without extra args
+    for group in optimizer.param_groups:
+        group["scheduler"] = scheduler
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_acc = 0.0
@@ -385,8 +420,6 @@ def main():
     temperature = 1.0
 
     for epoch in range(1, args.epochs + 1):
-        if epoch > 1:
-            temperature = 0.01
         #if 4 < epoch < 15:
         #    temperature = 0.3
         #elif epoch >= 15:
@@ -418,6 +451,12 @@ def main():
             f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} train_acc_grid={train_acc_grid:.4f} | "
             f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
         )
+        # Report current LR (first param group)
+        try:
+            cur_lr = optimizer.param_groups[0]["lr"]
+            print(f"[LR] lr={cur_lr:.6e} (warmup_steps={warmup_steps}, total_steps={total_steps}, min_scale={args.min_lr_scale})")
+        except Exception:
+            pass
         # Optionally report ACT stats
         if getattr(model, "act_enabled", False) and hasattr(model, "_last_act_epoch_stats"):
             stats = model._last_act_epoch_stats
