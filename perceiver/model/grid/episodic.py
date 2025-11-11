@@ -132,6 +132,13 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         dropout: float = 0.1,
         activation_checkpointing: bool = False,
         activation_offloading: bool = False,
+        # ACT (Adaptive Computation Time)
+        act_enabled: bool = False,
+        act_max_steps: int = None,
+        act_threshold: float = 0.99,
+        act_epsilon: float = 1e-2,
+        act_min_steps: int = 1,
+        act_temperature: float = 1.0,
     ):
         episodic_input_adapter = EpisodicGridInputAdapter(
             grid_shape=grid_shape,
@@ -188,6 +195,18 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
         super().__init__(encoder, decoder)
         self._query_input_adapter = query_input_adapter
+        # ACT config
+        self.act_enabled = act_enabled
+        self.act_max_steps = act_max_steps if act_max_steps is not None else max(1, num_self_attention_blocks)
+        self.act_threshold = act_threshold
+        self.act_epsilon = act_epsilon
+        self.act_min_steps = act_min_steps
+        self.act_temperature = act_temperature
+        # Halting head
+        self._halt_norm = nn.LayerNorm(num_latent_channels)
+        self._halt_proj = nn.Linear(num_latent_channels, 1)
+        # Stats holder (read by training loop if needed)
+        self._last_act_stats = {}
 
     def forward(
         self,
@@ -213,16 +232,92 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         encoder = self.encoder
         x_latents = encoder.latent_provider()
         x_latents = encoder.cross_attn_1(x_latents, x_latent).last_hidden_state
-        x_latents = encoder.self_attn_1(x_latents).last_hidden_state
-        cross_attn_n = encoder.cross_attn_n if encoder.extra_cross_attention_layer else encoder.cross_attn_1
-        self_attn_n = encoder.self_attn_n if encoder.extra_self_attention_block else encoder.self_attn_1
-        for i in range(1, encoder.num_self_attention_blocks):
-            if i < encoder.num_cross_attention_layers:
-                x_latents = cross_attn_n(x_latents, x_latent).last_hidden_state
-            x_latents = self_attn_n(x_latents).last_hidden_state
+        if self.act_enabled:
+            x_latents, expected_steps = self._act_refine_latents(
+                x_latents,
+                transition_block=encoder.self_attn_1,
+                max_steps=self.act_max_steps,
+                threshold=self.act_threshold,
+                epsilon=self.act_epsilon,
+                min_steps=self.act_min_steps,
+                temperature=self.act_temperature,
+            )
+            # Save for training loop (avoid changing public API)
+            self._last_act_stats = {"expected_steps": expected_steps.detach()}
+        else:
+            # Fixed-depth refinement as before
+            x_latents = encoder.self_attn_1(x_latents).last_hidden_state
+            cross_attn_n = encoder.cross_attn_n if encoder.extra_cross_attention_layer else encoder.cross_attn_1
+            self_attn_n = encoder.self_attn_n if encoder.extra_self_attention_block else encoder.self_attn_1
+            for i in range(1, encoder.num_self_attention_blocks):
+                if i < encoder.num_cross_attention_layers:
+                    x_latents = cross_attn_n(x_latents, x_latent).last_hidden_state
+                x_latents = self_attn_n(x_latents).last_hidden_state
 
         # Build query-only adapted tokens and decode
         x_adapted_query = self._query_input_adapter(query_x)  # (b, hw, Cq)
         return self.decoder(x_latents, x_adapted=x_adapted_query)
+
+    def _act_refine_latents(
+        self,
+        x_latents: torch.Tensor,
+        transition_block: nn.Module,
+        max_steps: int,
+        threshold: float,
+        epsilon: float,
+        min_steps: int,
+        temperature: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Adaptive refinement of latents using a recurrent application of a self-attention block.
+        Returns:
+          - aggregated latents (B, N, D)
+          - expected_steps per example (B,)
+        """
+        b, n, d = x_latents.shape
+        device = x_latents.device
+
+        # Maintain accumulators in float32 for numerical stability
+        agg = torch.zeros((b, n, d), device=device, dtype=torch.float32)
+        halting_acc = torch.zeros((b,), device=device, dtype=torch.float32)
+        exp_steps = torch.zeros((b,), device=device, dtype=torch.float32)
+
+        latents = x_latents
+
+        for t in range(1, max_steps + 1):
+            # Transition
+            latents = transition_block(latents).last_hidden_state
+            # Halting probability per example
+            pooled = latents.mean(dim=1)  # (B, D)
+            halted_logits = self._halt_proj(self._halt_norm(pooled)).squeeze(-1)  # (B,)
+            if temperature != 1.0:
+                halted_logits = halted_logits / float(temperature)
+            p_t = torch.sigmoid(halted_logits).to(torch.float32)  # (B,)
+
+            # Active mask
+            m_active = (halting_acc < threshold).to(torch.float32)  # (B,)
+            remaining = (1.0 - halting_acc)  # (B,)
+            # How much mass to take this step
+            new_mass = torch.minimum(p_t, remaining)
+            # If we cross threshold this step, take the remainder
+            weight_t = torch.where(halting_acc + p_t >= threshold, remaining, new_mass)  # (B,)
+            weight_t = weight_t * m_active
+
+            # Accumulate weighted latents
+            agg = agg + weight_t.view(b, 1, 1) * latents.to(torch.float32)
+            halting_acc = halting_acc + weight_t
+            exp_steps = exp_steps + weight_t
+
+            # Early exit if everyone halted and min_steps satisfied
+            if t >= min_steps and torch.all(halting_acc >= (threshold - 1e-6)):
+                break
+
+        # Normalize in case sum(weights) < 1 due to epsilon; avoid division by zero
+        normalizer = torch.clamp(halting_acc, min=epsilon).view(b, 1, 1)
+        agg = agg / normalizer
+
+        # Cast back to original dtype
+        agg = agg.to(x_latents.dtype)
+        return agg, exp_steps
 
 

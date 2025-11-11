@@ -1,244 +1,183 @@
-## Plan: Episodic Perceiver IO for ARC-AGI Grid Puzzles
+Perceiver IO Episodic + ACT: Implementation Plan
 
-### Scope and goal
-- Build an episodic, meta-learning variant of Perceiver IO that induces a puzzle-specific transformation from a small support set of input/output grid pairs and applies it to a new query input grid.
-- Focus exclusively on Perceiver IO (not Perceiver/AR). Keep changes minimal and localized to a new backend and a dedicated training script (no Lightning).
+Overview
 
-Target setting (default, configurable):
-- Each episode = one puzzle
-- Support = K examples (default K=3)
-- Query = 1 input grid (supervised training has its target; inference doesn’t)
-- Grid size = 17×17; values in [0, 9] (vocabulary can be generalized)
+- Goal: Add an Adaptive Computation Time (ACT) loop around the latent backbone of the episodic, meta-learning Perceiver IO model (`EpisodicGridPerceiverIO`) and adapt the training pipeline to supervise both prediction accuracy and computation budget.
+- Scope: Only the Perceiver IO variant and its episodic grid model. Keep changes minimal and contained; avoid modifying generic core modules unless strictly necessary.
+- High-level idea: Perform the initial cross-attention once to seed the latent array from the episodic input sequence, then iterate latent self-attention with an ACT controller that decides, per example, how many refinement steps are needed before halting. Aggregate intermediate latent states using ACT weighting and decode once into the output grid queries.
 
+Context Recap (Current Design)
 
-### Guiding design principle
-Use Perceiver IO’s encoder latent array as an episodic memory written from the support examples. The decoder then answers the query by cross-attending from output-position queries (derived from the query input grid) into that support-written latent memory.
+- Episodic input encoding:
+  - `EpisodicGridInputAdapter` builds a single sequence by concatenating K support input grids, K support output grids, and the single query input grid. Roles and pair embeddings distinguish segments; 2D Fourier features encode positions.
+- Encoder/decoder backbone (Perceiver IO):
+  - Encoder seeds a latent array via cross-attention, then refines with self-attention blocks; decoder cross-attends from output queries (built from the query input grid) to latents and projects to class logits per grid cell.
+- Episodic model specifics (`perceiver/model/grid/episodic.py`):
+  - To avoid double adaptation, `EpisodicGridPerceiverIO.forward` manually routes through `encoder.latent_provider`, `encoder.cross_attn_1`, and (shared) self-attention blocks.
 
+Why ACT and Where to Apply It
 
-### Architectural overview
-We extend the existing grid backend to an episodic variant:
+- Motivation: Different puzzles vary in difficulty. A fixed number of self-attention blocks either over-computes simple cases or under-computes complex ones. ACT allows dynamic depth per example with a penalty for extra computation.
+- Placement: Wrap ACT around the latent refinement stage (self-attention). Keep the seeding cross-attention fixed at step 0 (always run once to initialize latents). Decode after ACT completes.
 
-- Encoder input: a single concatenated token sequence containing
-  - K support input grids
-  - K support output grids
-  - 1 query input grid
-- Decoder query: tokens derived only from the query input grid (one query per output cell)
-- Output: per-cell classification logits for the query output grid
+Design Decisions
 
-This preserves the Perceiver IO pattern:
-- Encoder: latent array cross-attends to a long, task-specific input sequence (here: all support and query-input tokens), then self-attends.
-- Decoder: output queries (here: query-input tokens) cross-attend into latents and are mapped to per-cell classes.
+1) Halting granularity
+- Start simple with example-wise halting (one halting decision per batch element, shared across all latents). This keeps code localized and avoids complex variable-length masks per latent token.
+- Optionally extend later to per-latent halting (token-wise ACT) for finer control.
 
+2) What constitutes a “step”
+- One step = one “self-attention block” application (the same unit already repeated in the encoder). If the model uses shared self-attention weights across blocks, we reuse the shared block; otherwise we reuse the first block weights for steps beyond the first to minimize changes.
 
-### Key components to add
-1) Episodic input adapter
-   - `EpisodicGridInputAdapter` (new):
-     - Reuses the single-grid embedding routine (value embedding + 2D Fourier position encoding) to encode any grid into `(B, H*W, C_base)`.
-     - Adds:
-       - Role embeddings: one of {support_input, support_output, query_input}.
-       - Pair-index embeddings for support examples: {0, …, K-1}.
-     - Returns a concatenated sequence:
-       `[support_0_in, support_0_out, support_1_in, support_1_out, ..., support_{K-1}_in, support_{K-1}_out, query_in]`
-       Each segment has shape `(B, H*W, C_base + C_role + C_pair)`.
-     - Variable K is supported by concatenation; pair-index embeddings can be implemented as a small learned table up to a configurable `max_support` (default 5), or via sinusoidal embedding of the scalar pair index.
+3) Aggregation of intermediate states
+- Use standard ACT aggregation: the final latent state is the weighted sum of intermediate latent states with weights given by the step-wise halting probabilities, including the remainder on the final step.
 
-2) Query-only input adapter
-   - Reuse the existing `GridInputAdapter` for the query’s output queries (one token per output position).
-   - Its channel count defines `num_output_query_channels` for the decoder and output adapter.
+4) Halting head
+- A small projection from the pooled latents to a scalar per example: p_t = sigmoid(Linear(LayerNorm(mean_pool(latents)))) with optional temperature. Keep it minimal to avoid destabilizing training.
 
-3) Episodic backend
-   - `EpisodicGridPerceiverIO` (new):
-     - Encoder: `PerceiverEncoder(input_adapter=EpisodicGridInputAdapter, ...)`.
-     - Decoder:
-       - `output_query_provider = GridQueryProvider(num_query_channels=query_adapter.num_input_channels)`
-       - `output_adapter = GridClassificationOutputAdapter(grid_shape, num_output_query_channels=query_adapter.num_input_channels, num_classes)`
-     - Forward signature (train): `forward(support_x: LongTensor[B,K,H,W], support_y: LongTensor[B,K,H,W], query_x: LongTensor[B,H,W]) -> logits[B,H,W,num_classes]`
-       - Build episodic input (support_x, support_y, query_x) and feed to encoder.
-       - Build query-only adapted tokens via `GridInputAdapter(query_x)` and pass as `x_adapted` to the decoder.
-       - Decoder returns per-cell logits; compute CE against `query_y` in the training loop.
-     - Forward signature (inference): `forward_episode(support_x, support_y, query_x)` with no targets.
+5) Losses
+- Task loss: unchanged (episodic grid classification over the output grid).
+- Ponder loss: λ_ponder * expected_steps (per example), averaged across the batch. Expected steps is the ACT aggregate of step usage.
 
-4) Dataset and training loop (pure PyTorch)
-   - `EpisodicGridDataset`:
-     - Each item loads a puzzle with >= K+1 examples.
-     - Samples/augments K support pairs `(x_i, y_i)` and 1 query `(x_q, y_q)` (during training `y_q` exists; at test-time you may withhold).
-     - Returns tensors shaped `(K,H,W)` for support_x/support_y and `(H,W)` for query_x/query_y.
-   - Training:
-     - Loss: per-cell CrossEntropy on predicted `y_q` (flatten `(B*H*W, C)` vs `(B*H*W,)`), same as current grid training.
-     - Metrics: per-cell accuracy; exact-grid accuracy on the query prediction.
-     - AMP, AdamW, LR-schedule/grad clipping optional.
+6) Mixed precision and numerics
+- Maintain halting accumulators in float32 even under AMP; use `.float()` casts where necessary. Keep dropout and model precision unchanged.
 
+Public API and Configuration
 
-### Data and episode format
-Recommended JSON structure for episodic data:
-```json
-{
-  "puzzles": [
-    {
-      "examples": [
-        { "input": [[...17...], ...17...], "output": [[...17...], ...17...] },
-        ...
-      ]
-    },
-    ...
-  ]
-}
-```
-- Training sampler enforces each episode has at least K+1 examples.
-- Optional augmentations per episode:
-  - 90° rotations and flips
-  - Color-value permutation (bijection on [0..9])
-  - Crops/pads if you later generalize beyond 17×17
+- Add optional ACT parameters to `EpisodicGridPerceiverIO`:
+  - `act_enabled: bool = False`
+  - `act_max_steps: int = num_self_attention_blocks` (upper bound)
+  - `act_threshold: float = 1.0 - 1e-2` (halting mass needed to stop)
+  - `act_epsilon: float = 1e-2` (stability slack)
+  - `act_ponder_cost: float = 1e-3` (λ_ponder; tune)
+  - `act_min_steps: int = 1` (optional warmup steps before halting allowed)
+  - `act_temperature: float = 1.0` (optional scaling for halting logits)
+- Surface these in the training script via flags; default to ACT off to preserve current behavior.
 
+Core Algorithm (Example-wise ACT over self-attention)
 
-### Tensor shapes (summary)
-- Base single-grid adapter (`GridInputAdapter`):
-  - Input grid `(B,H,W)` → `(B, H*W, C_base)`
-- Episodic adapter (`EpisodicGridInputAdapter`):
-  - Support input `(B,K,H,W)` → `(B, K*H*W, C_base + C_role + C_pair)`
-  - Support output `(B,K,H,W)` → `(B, K*H*W, C_base + C_role + C_pair)`
-  - Query input `(B,H,W)` → `(B, H*W, C_base + C_role + C_pair)`
-  - Concatenated episodic input: `(B, M_epi, C_epi)` with `M_epi = (2K+1)*H*W` and `C_epi = C_base + C_role + C_pair`
-- Encoder latents: `(B, N, D)`
-- Decoder queries (query-only adapter): `(B, H*W, C_query)`
-- Output logits: `(B, H, W, num_classes)`
+Initialization
 
+1) Build episodic adapted inputs X_adapted and initialize latents L0 via cross-attention as today.
+2) Set:
+   - step = 0
+   - halting_acc = zeros([B], float32)
+   - remainder = zeros([B], float32)
+   - act_weights_sum = zeros([B, 1, 1], float32)  // optional for sanity checks
+   - L_agg = zeros_like(L0, float32)              // weighted sum of latents
 
-### How it fits existing code
-- Encoder/decoder are unchanged; we only supply:
-  - A new input adapter that understands episodic structure and returns a long concatenated sequence.
-  - A decoder query provider that uses query-only adapted tokens (same `GridQueryProvider` pattern used today).
-- The pattern matches the existing grid backend and optical-flow backend: decoder queries are derived from inputs while the encoder writes context into latents.
+Loop
 
+For t in 1..act_max_steps:
 
-### Training pipeline
-1) Dataloader
-   - Batch of episodes: collate lists of `(support_x, support_y, query_x, query_y)` to tensors:
-     - `support_x`: `(B,K,H,W)`
-     - `support_y`: `(B,K,H,W)`
-     - `query_x`: `(B,H,W)`
-     - `query_y`: `(B,H,W)`
-   - Optional per-episode random augmentation and color remapping.
+1) Compute new latent state: L_t = SelfAttentionBlock(L_{t-1}).
+2) Compute halting probability per example:
+   - h_t = sigmoid(W · LN(mean_pool(L_t)) / act_temperature)
+   - p_t = clamp(h_t, 0, 1)
+3) Determine still-active examples: m_active = (halting_acc < act_threshold) as float32.
+4) Compute new mass to add:
+   - new_mass = m_active * (1 - halting_acc)
+   - weight_t = where(halting_acc + p_t >= act_threshold, new_mass, p_t)
+5) Update aggregate latent and accumulators:
+   - L_agg += weight_t.view(B, 1, 1) * L_t
+   - halting_acc += weight_t
+   - act_weights_sum += weight_t.view(B, 1, 1)
+6) Early exit if all examples have halting_acc >= act_threshold and t >= act_min_steps.
 
-2) Forward
-   - `logits = model(support_x, support_y, query_x)` → `(B,H,W,num_classes)`
+Output
 
-3) Loss and metrics
-   - CE over flattened cells; per-cell and exact-grid accuracy.
+- Use L_agg (ACT-aggregated latents) as the encoder output to the Perceiver decoder.
+- Ponder metrics:
+  - expected_steps = sum_t weight_t  (per example)
+  - remainder = 1 - sum_t weights if < threshold before max steps (implicitly captured by weight_t on the last step)
 
-4) Optimization
-   - AdamW; consider cosine schedule with warmup; optional grad clipping (global norm or value clip).
+Training Objective
 
-5) Checkpointing and logging
-   - Track best validation per-cell accuracy; also report exact-grid accuracy.
-   - Optionally dump per-episode predictions for visualization (as done in the single-grid trainer).
+Loss = task_loss + act_ponder_cost * mean(expected_steps)
 
+- task_loss: unchanged episodic loss (per-token CE + episode-level weighting) already used in your script.
+- expected_steps: computed per example from ACT; average across batch.
 
-### Minimal implementation plan
-Files to add (keeping modifications isolated):
-- `perceiver/model/grid/episodic.py`
-  - `EpisodicGridInputAdapter`
-    - Reuse components from `GridInputAdapter` (value embedding and Fourier position encoding).
-    - Add `nn.Embedding` for roles (size 3) and for pair indices (size `max_support`).
-    - Concatenate role and pair embeddings to each token.
-    - Forward accepts a struct (e.g., dict) with `support_in`, `support_out`, `query_in` and returns the concatenated sequence.
-  - `EpisodicGridPerceiverIO`
-    - Build encoder with `EpisodicGridInputAdapter`.
-    - Build a separate `GridInputAdapter` for query-only decoding.
-    - Use `GridQueryProvider` and `GridClassificationOutputAdapter` like the single-grid model, with `num_output_query_channels` from the query-only adapter.
-    - `forward(support_x, support_y, query_x)` encodes the episode; decodes from query-only adapted tokens.
+Minimal Code Changes (File-local)
 
-- `examples/training/grid/train_episodic.py`
-  - `EpisodicGridDataset` and training loop mirroring `examples/training/grid/train.py`, adapted to episode sampling.
-  - CLI: `--data`, `--episodes-per-epoch`, `--support-k`, `--batch-size`, `--lr`, `--epochs`, `--no-amp`, `--save-dir`, augmentation flags.
+- Keep changes contained to the episodic model and training script:
+  1) `perceiver/model/grid/episodic.py`
+     - Add ACT config parameters to `EpisodicGridPerceiverIO.__init__` (with defaults).
+     - Add halting head modules: `LayerNorm(num_latent_channels)` + `Linear(num_latent_channels, 1)`.
+     - Implement an internal `_act_refine_latents(latents)` that runs the loop above and returns `(latents_agg, expected_steps)`.
+     - In `forward`, after the initial cross-attention:
+       - If `act_enabled`: call `_act_refine_latents` to obtain `x_latents` and `expected_steps`.
+       - Else: keep existing fixed self-attention pass (current behavior).
+     - Return logits as today; attach `expected_steps` onto a small return structure only if you prefer, or stash into a model attribute (e.g., `self._last_act_stats`) to avoid breaking callers.
+  2) `examples/training/grid/train_episodic.py`
+     - Add CLI flags for ACT params and `--act-enabled` toggle.
+     - During training:
+       - Fetch `expected_steps` from the model (e.g., `model._last_act_stats`) if ACT is enabled; compute `ponder_loss = lambda * expected_steps.mean()` and add to task loss.
+       - Log average `expected_steps`, halting coverage (fraction halted before max steps), and final step histogram for monitoring.
 
-Optional (later):
-- `perceiver/model/grid/__init__.py` export of the new backend class.
+Notes on Using Existing Blocks
 
+- Self-attention block reuse: Today the model either shares or not shares weights between blocks. For ACT, we can repeatedly apply:
+  - If `encoder.extra_self_attention_block` is False: use `encoder.self_attn_1` every step (shared weights).
+  - Else: use `encoder.self_attn_n` for steps ≥ 2 (already how the current loop is structured for multiple blocks). For ACT, consistently reuse one of them to form a recurrent “transition” function; prefer the shared one for stability.
+- Cross-attention refresh: Keep it out of the loop for v1 (simpler and matches “seed then refine”). Consider periodic cross-attn refresh later if needed.
 
-### Hyperparameters and defaults
-- `K` (support size): 3
-- `num_latents` `N`: 17×17 (289) or smaller (e.g., 128) depending on budget
-- `num_latent_channels` `D`: 256–512
-- Heads/layers:
-  - Cross/self heads: 8–16
-  - Self-attn layers per block: 8–16
-  - Self-attn blocks: 4–16 (weight sharing can reduce params)
-- Dropout: 0.1–0.2
-- Embedding sizes:
-  - Value embedding: 32–64
-  - Positional Fourier bands: 16–32
-  - Role embedding: 8–16
-  - Pair embedding: 8–16
+Compatibility and Defaults
 
+- With `act_enabled=False`, behavior and outputs remain identical to current implementation.
+- With `act_enabled=True`, the only change to the training step is the added ponder loss and the dynamic number of latent refinements.
 
-### Ablations and variants
-- Where to put role/pair signals:
-  - Concatenate as channels (proposed), or add as bias via small MLP.
-  - Try shared vs separate value embeddings for inputs and outputs.
-  - Try omitting support outputs (use inputs-only memory) as a control.
+Hyperparameters and Recommendations
 
-- Episode tokenization layout:
-  - Interleave per-pair `[x_i, y_i]` vs grouping all X then all Y. The per-pair interleave should aid locality; keep as default.
+- act_max_steps: start at the current `num_self_attention_blocks`. If blocks are “macro” (each with multiple layers), consider increasing `max_steps` and reducing per-block depth to create finer ACT control.
+- act_threshold and act_epsilon: use threshold=0.99 and epsilon=1e-2 initially.
+- act_ponder_cost (λ): start small (1e-4 to 1e-3). Increase if model overcomputes; decrease if undercomputes.
+- act_temperature: 1.0 initially; adjust if halting saturates too early or too late.
+- act_min_steps: set to 1–2 for stability during warmup.
 
-- Query provider options:
-  - Use query-only adapter (proposed).
-  - Alternative: learned queries plus conditioning on query input via an additional encoder pass (heavier).
+Metrics and Logging
 
-- Few-shot size:
-  - Train with K∈{1,2,3} via sampling to improve robustness.
+- Add to training logs (if ACT enabled):
+  - mean_expected_steps, median_expected_steps, fraction_halted_before_max, final_step_histogram
+  - task metrics unchanged (per-cell accuracy, per-grid accuracy; existing logs remain).
 
-- Augmentation:
-  - Study color remap and rotations to encourage permutation/rotation invariance.
+Evaluation and Inference
 
+- Same ACT loop at inference; no ponder loss term. Optionally clamp `act_min_steps` higher during evaluation for more stable performance.
+- For deterministic latency budgets, you can disable ACT at inference and run at a fixed step budget equal to a high-percentile of training `expected_steps`—this is optional.
 
-### Risks and mitigations
-- Latent capacity: When `M_epi = (2K+1) H W` grows, ensure `N` and `D` are sufficient. Mitigate with more self-attn depth and adequate `N` (≥ H*W is safe but expensive).
-- Leakage of query target: Ensure the episodic adapter never encodes `query_y` during training.
-- Overfitting to color indices: Use color permutation augmentation.
-- Memory: Use AMP, reduce `N`, `D`, or layers if OOM; consider gradient checkpointing already supported by core modules.
+Testing Strategy (Recommended)
 
+- Unit tests:
+  - Check halting convergence on synthetic data (monotonic p_t → halt in ≤ 3 steps).
+  - Check aggregation weights sum to ~1.0 (within epsilon) per example.
+  - Check shape invariants and device/dtype handling under AMP.
+- Regression tests:
+  - With ACT disabled, ensure identical outputs to pre-ACT model given the same seed and weights.
 
-### Milestones
-1) Backend and adapter
-   - Implement `EpisodicGridInputAdapter` and `EpisodicGridPerceiverIO`.
-   - Unit test on synthetic episodes (shape checks; forward pass).
-2) Training loop
-   - Implement `EpisodicGridDataset`, sampler, collate, augmentation.
-   - Train sanity-check runs; verify loss decreases; evaluate per-cell/exact-grid metrics.
-3) Evaluation/inference
-   - Script path to load support examples and predict for a withheld query input; JSON or image visualization.
-4) Ablations
-   - Toggle role/pair embeddings, K, and layout; track metrics.
+Potential Extensions (Later)
 
+- Per-latent ACT: token-wise halting with masks and partial updates; more flexible but more complex.
+- Curriculum or schedule for λ_ponder and act_temperature.
+- Occasional cross-attention refresh during ACT steps (every N steps) for long inputs.
+- Alternative halting heads (e.g., attention pooling over latents).
 
-### Minimal surface changes (commit plan)
-- Add `perceiver/model/grid/episodic.py`
-- Add `examples/training/grid/train_episodic.py`
-- Optionally export from `perceiver/model/grid/__init__.py`
-- No edits to core modules are required.
+Implementation Checklist
 
+1) Episodic model updates (`perceiver/model/grid/episodic.py`)
+   - [ ] Add ACT params and halting head
+   - [ ] Implement `_act_refine_latents`
+   - [ ] Wire into `forward` with opt-in flag
+2) Training script updates (`examples/training/grid/train_episodic.py`)
+   - [ ] Add CLI flags for ACT
+   - [ ] Add ponder loss to the objective when ACT is enabled
+   - [ ] Log ACT metrics
+3) Validation
+   - [ ] Smoke test on a small subset (1–2 epochs) to validate halting behavior and loss decreases
+   - [ ] Compare accuracy/latency tradeoff across λ_ponder values
 
-### API sketch (for reference)
-Episodic backend construction (defaults omitted):
-```python
-model = EpisodicGridPerceiverIO(
-    grid_shape=(17, 17),
-    num_classes=10,
-    max_support=5,   # for pair-index embeddings
-    # encoder/decoder hyperparams...
-)
-```
-Training step:
-```python
-logits = model(support_x, support_y, query_x)   # (B,H,W,C)
-loss = ce(logits.view(B*H*W, C), query_y.view(B*H*W))
-```
+Minimality and Containment
 
-
-### What success looks like
-- On held-out episodes, exact-grid accuracy for the query output significantly exceeds single-pair training baselines.
-- Robustness to color permutations and geometric transforms via augmentation.
-- Clean integration with existing Perceiver IO code paths; small, isolated code surface area.
+- All logic is localized to the episodic model file and the episodic training script. No changes to generic core modules (`perceiver/model/core/*`) are required for v1.
 
 

@@ -120,11 +120,14 @@ def episodic_loss(pred, target, lambda_=5.0, threshold=0.9, temperature=1.0):
 
     return loss, ce.item(), acc.item(), weight.item()
 
-def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temperature=1.0):
+def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temperature=1.0, ponder_cost: float = 0.0):
     model.train()
     running_loss = 0.0
     running_acc = 0.0
     num_batches = 0
+    # ACT tracking
+    act_steps_sum = 0.0
+    act_batches = 0
 
     autocast = torch.cuda.amp.autocast if scaler is not None else torch.cpu.amp.autocast
 
@@ -141,6 +144,17 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
             b, h, w, c = logits.shape
             loss, ce_val, acc, w = loss_fn(logits.view(b * h * w, c), q_out.view(b * h * w))
 
+            # Add ACT ponder cost if enabled and stats available
+            if getattr(model, "act_enabled", False) and ponder_cost > 0.0:
+                stats = getattr(model, "_last_act_stats", None)
+                if stats is not None and "expected_steps" in stats:
+                    exp_steps = stats["expected_steps"]
+                    ponder = float(ponder_cost) * exp_steps.mean()
+                    loss = loss + ponder
+                    # Track for epoch-level logging
+                    act_steps_sum += exp_steps.detach().float().mean().item()
+                    act_batches += 1
+
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -154,6 +168,12 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
         num_batches += 1
 
     denom = max(1, num_batches)
+    # Save epoch-level ACT stats on the model for optional logging in main
+    if getattr(model, "act_enabled", False) and act_batches > 0:
+        mean_steps = act_steps_sum / max(1, act_batches)
+        model._last_act_epoch_stats = {"mean_expected_steps": mean_steps}
+    else:
+        model._last_act_epoch_stats = {}
     return running_loss / denom, running_acc / denom
 
 
@@ -213,6 +233,14 @@ def main():
     parser.add_argument("--save-dir", type=str, default="checkpoints")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--support-k", type=int, default=3)
+    # ACT options
+    parser.add_argument("--act-enabled", action="store_true")
+    parser.add_argument("--act-max-steps", type=int, default=None)
+    parser.add_argument("--act-threshold", type=float, default=0.99)
+    parser.add_argument("--act-epsilon", type=float, default=1e-2)
+    parser.add_argument("--act-min-steps", type=int, default=1)
+    parser.add_argument("--act-temperature", type=float, default=1.0)
+    parser.add_argument("--act-ponder-cost", type=float, default=1e-3)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -249,6 +277,12 @@ def main():
         num_self_attention_layers_per_block=8,
         num_self_attention_blocks=2,
         dropout=0.15,
+        act_enabled=args.act_enabled,
+        act_max_steps=args.act_max_steps,
+        act_threshold=args.act_threshold,
+        act_epsilon=args.act_epsilon,
+        act_min_steps=args.act_min_steps,
+        act_temperature=args.act_temperature,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -270,7 +304,22 @@ def main():
         elif epoch >= 30:
             temperature = 0.05
 
-        train_loss, train_acc = train_epoch(model, train_dl, optimizer, loss_fn, device, scaler=scaler, temperature=temperature)
+        train_loss, train_acc = train_epoch(
+            model,
+            train_dl,
+            optimizer,
+            loss_fn,
+            device,
+            scaler=scaler,
+            temperature=temperature,
+            ponder_cost=args.act_ponder_cost if args.act_enabled else 0.0,
+        )
+        # Add ponder loss if ACT is enabled (computed on-the-fly from model stats)
+        if getattr(model, "act_enabled", False):
+            # Re-run logging averages over last epoch via stored stats inside training loop if available
+            # Note: We compute ponder on each batch during training for correctness; here we just read stats for logging.
+            pass
+
         val_loss, val_acc_cell, val_acc_grid = eval_epoch(model, test_dl, loss_fn, device, temperature=temperature)
 
         print(
@@ -278,6 +327,12 @@ def main():
             f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} | "
             f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
         )
+        # Optionally report ACT stats
+        if getattr(model, "act_enabled", False) and hasattr(model, "_last_act_epoch_stats"):
+            stats = model._last_act_epoch_stats
+            mean_steps = stats.get("mean_expected_steps", None)
+            if mean_steps is not None:
+                print(f"[Episodic][ACT] mean_expected_steps={mean_steps:.3f} (ponder_cost={args.act_ponder_cost})")
 
         if epoch % 10 == 0:
             # dump test predictions for later analysis
