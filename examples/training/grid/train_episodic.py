@@ -124,6 +124,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
     model.train()
     running_loss = 0.0
     running_acc = 0.0
+    running_acc_grid = 0.0
     num_batches = 0
     # ACT tracking
     act_steps_sum = 0.0
@@ -165,6 +166,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
 
         running_loss += loss.item()
         running_acc += accuracy_per_cell(logits.detach(), q_out)
+        running_acc_grid += accuracy_exact_grid(logits.detach(), q_out)
         num_batches += 1
 
     denom = max(1, num_batches)
@@ -174,7 +176,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler=None, temp
         model._last_act_epoch_stats = {"mean_expected_steps": mean_steps}
     else:
         model._last_act_epoch_stats = {}
-    return running_loss / denom, running_acc / denom
+    return running_loss / denom, running_acc / denom, running_acc_grid / denom
 
 
 @torch.no_grad()
@@ -271,12 +273,12 @@ def main():
         pair_embedding_dim=16,
         max_support=max(5, args.support_k),
         num_latents=30 * 30,
-        num_latent_channels=256,
+        num_latent_channels=512,
         num_cross_attention_heads=8,
         num_self_attention_heads=8,
         num_self_attention_layers_per_block=8,
-        num_self_attention_blocks=2,
-        dropout=0.15,
+        num_self_attention_blocks=16,
+        dropout=0.1,
         act_enabled=args.act_enabled,
         act_max_steps=args.act_max_steps,
         act_threshold=args.act_threshold,
@@ -304,7 +306,7 @@ def main():
         elif epoch >= 30:
             temperature = 0.05
 
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, train_acc_grid = train_epoch(
             model,
             train_dl,
             optimizer,
@@ -324,7 +326,7 @@ def main():
 
         print(
             f"[Episodic] Epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} | "
+            f"train_loss={train_loss:.4f} train_acc_cell={train_acc:.4f} train_acc_grid={train_acc_grid:.4f} | "
             f"val_loss={val_loss:.4f} val_acc_cell={val_acc_cell:.4f} val_acc_grid={val_acc_grid:.4f}"
         )
         # Optionally report ACT stats
