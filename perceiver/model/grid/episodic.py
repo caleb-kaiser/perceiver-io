@@ -129,6 +129,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         num_self_attention_heads: int = 4,
         num_self_attention_layers_per_block: int = 4,
         num_self_attention_blocks: int = 1,
+        num_inner_loops: int = 6,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
         activation_offloading: bool = False,
@@ -208,6 +209,8 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         # Stats holder (read by training loop if needed)
         self._last_act_stats = {}
 
+        self.num_inner_loops = num_inner_loops
+
     def forward(
         self,
         support_x: torch.Tensor,
@@ -238,33 +241,36 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         if self.act_enabled:
 
             # Maintain accumulators in float32 for numerical stability
+            still_active = torch.ones((b,), device=device, dtype=torch.float32)
             agg = torch.zeros((b, n, d), device=device, dtype=torch.float32)
-            halting_acc = torch.zeros((b,), device=device, dtype=torch.float32)
+            halting_prob = torch.zeros((b,), device=device, dtype=torch.float32)
             exp_steps = torch.zeros((b,), device=device, dtype=torch.float32)
+            remainders = torch.zeros((b,), device=device, dtype=torch.float32)
+            weighted_sums = torch.zeros((b, n, d), device=device, dtype=torch.float32)
+            n_updates = torch.zeros((b,), device=device, dtype=torch.int32)
+            latents = x_latents
 
             for t in range(1, self.act_min_steps + 1):
-                x_latents = self.act_step(x_latents, self.act_threshold, self.act_epsilon, self.act_temperature)
-                pooled = x_latents.mean(dim=1)  # (B, D)
-                halted_logits = self._halt_proj(self._halt_norm(pooled)).squeeze(-1)  # (B,)
-                if self.act_temperature != 1.0:
-                    halted_logits = halted_logits / float(self.act_temperature)
-                p_t = torch.sigmoid(halted_logits).to(torch.float32)  # (B,)
-                m_active = (halting_acc < self.act_threshold).to(torch.float32)  # (B,)
-                remaining = (1.0 - halting_acc)  # (B,)
-                new_mass = torch.minimum(p_t, remaining)
-                weight_t = torch.where(halting_acc + p_t >= self.act_threshold, remaining, new_mass)  # (B,)
-                weight_t = weight_t * m_active
-                agg = agg + weight_t.view(b, 1, 1) * x_latents
-                halting_acc = halting_acc + weight_t
-                exp_steps = exp_steps + weight_t
-                if t >= self.act_min_steps and torch.all(halting_acc >= (self.act_threshold - 1e-6)):
-                    break
+                for i in range(self.num_inner_loops):
+                    latents, still_active, halting_prob, remainders, weighted_sums, n_updates = self.act_step(
+                        latents, 
+                        self.act_threshold, 
+                        self.act_epsilon, 
+                        self.act_temperature, 
+                        still_active, 
+                        halting_prob,
+                        remainders,
+                        weighted_sums,
+                        n_updates,
+                    )
 
-            x_latents = agg / halting_acc
-            expected_steps = exp_steps
+                    if not still_active.any():
+                        break
 
-            # Save for training loop (avoid changing public API)
-            self._last_act_stats = {"expected_steps": expected_steps.detach()}
+            x_latents = weighted_sums / halting_prob.unsqueeze(-1).clamp_min(1e-6)
+
+
+
         else:
             # Fixed-depth refinement as before
             x_latents = encoder.self_attn_1(x_latents).last_hidden_state
@@ -285,7 +291,12 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         latents: torch.Tensor, 
         threshold: float, 
         epsilon: float, 
-        temperature: float
+        temperature: float,
+        still_active: torch.Tensor,
+        halting_prob: torch.Tensor,
+        remainders: torch.Tensor,
+        weighted_sums: torch.Tensor,
+        n_updates: torch.Tensor,
     ) -> torch.Tensor:
         """
         One step of ACT refinement.
@@ -298,7 +309,22 @@ class EpisodicGridPerceiverIO(PerceiverIO):
                 x_latents = cross_attn_n(x_latents, x_latent).last_hidden_state
             x_latents = self_attn_n(x_latents).last_hidden_state
 
-        return x_latents
+        pooled = x_latents.mean(dim=1)  # (B, D)
+        halted_logits = self._halt_proj(self._halt_norm(pooled)).squeeze(-1)  # (B,)
+
+        p_t = torch.sigmoid(halted_logits).to(torch.float32)  # (B,)
+        p_t = p_t * still_active.float()
+
+        new_halted = (halting_prob + p_t > threshold).to(torch.float32) * still_active.float() # (B,)
+        still_active = (halting_prob + p_t <= threshold).to(torch.float32)  # (B,)
+
+        halting_prob = halting_prob + p_t * still_active.float() + new_halted.float() * (1.0 - halting_prob.float())
+        remainders = remainders + new_halted.float() * (1.0 - halting_prob.float())
+        weighted_sums = weighted_sums + p_t.unsqueeze(-1) * x_latents.to(torch.float32)
+        n_updates += still_active.int() + new_halted.int()
+
+        
+        return x_latents, still_active, halting_prob, remainders, weighted_sums, n_updates
 
     def _act_refine_latents(
         self,
