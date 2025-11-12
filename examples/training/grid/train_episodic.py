@@ -449,8 +449,9 @@ def main():
         num_latent_channels=512,
         num_cross_attention_heads=4,
         num_self_attention_heads=4,
-        num_self_attention_layers_per_block=1,
+        num_self_attention_layers_per_block=4,
         num_self_attention_blocks=2,
+        num_inner_loops=6,
         act_enabled=args.act_enabled,
         act_max_steps=args.act_max_steps,
         act_threshold=args.act_threshold,
@@ -570,3 +571,4 @@ if __name__ == "__main__":
 
 
 
+   # torchrun --nproc_per_node=4 examples/training/grid/train_episodic.py --epochs 10000 --batch-size 4 --lr 1e-4 --warmup-steps 2000 --min-lr-scale 0.1 --act-enabled --act-min-steps 1 --act-max-steps 100

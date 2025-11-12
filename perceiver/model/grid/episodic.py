@@ -267,7 +267,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
                     if not still_active.any():
                         break
 
-            x_latents = weighted_sums / halting_prob.unsqueeze(-1).clamp_min(1e-6)
+            x_latents = weighted_sums / halting_prob.unsqueeze(-1).unsqueeze(-1).clamp_min(1e-6)
 
 
 
@@ -320,73 +320,9 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
         halting_prob = halting_prob + p_t * still_active.float() + new_halted.float() * (1.0 - halting_prob.float())
         remainders = remainders + new_halted.float() * (1.0 - halting_prob.float())
-        weighted_sums = weighted_sums + p_t.unsqueeze(-1) * x_latents.to(torch.float32)
+        weighted_sums = weighted_sums + p_t.unsqueeze(-1).unsqueeze(-1) * x_latents.to(torch.float32)
         n_updates += still_active.int() + new_halted.int()
 
         
         return x_latents, still_active, halting_prob, remainders, weighted_sums, n_updates
-
-    def _act_refine_latents(
-        self,
-        x_latents: torch.Tensor,
-        transition_block: nn.Module,
-        max_steps: int,
-        threshold: float,
-        epsilon: float,
-        min_steps: int,
-        temperature: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Adaptive refinement of latents using a recurrent application of a self-attention block.
-        Returns:
-          - aggregated latents (B, N, D)
-          - expected_steps per example (B,)
-        """
-        b, n, d = x_latents.shape
-        device = x_latents.device
-
-        # Maintain accumulators in float32 for numerical stability
-        agg = torch.zeros((b, n, d), device=device, dtype=torch.float32)
-        halting_acc = torch.zeros((b,), device=device, dtype=torch.float32)
-        exp_steps = torch.zeros((b,), device=device, dtype=torch.float32)
-
-        latents = x_latents
-
-        for t in range(1, max_steps + 1):
-            # Transition
-            latents = transition_block(latents).last_hidden_state
-            # Halting probability per example
-            pooled = latents.mean(dim=1)  # (B, D)
-            halted_logits = self._halt_proj(self._halt_norm(pooled)).squeeze(-1)  # (B,)
-            if temperature != 1.0:
-                halted_logits = halted_logits / float(temperature)
-            p_t = torch.sigmoid(halted_logits).to(torch.float32)  # (B,)
-
-            # Active mask
-            m_active = (halting_acc < threshold).to(torch.float32)  # (B,)
-
-            remaining = (1.0 - halting_acc)  # (B,)
-            # How much mass to take this step
-            new_mass = torch.minimum(p_t, remaining)
-            # If we cross threshold this step, take the remainder
-            weight_t = torch.where(halting_acc + p_t >= threshold, remaining, new_mass)  # (B,)
-            weight_t = weight_t * m_active
-
-            # Accumulate weighted latents
-            agg = agg + weight_t.view(b, 1, 1) * latents.to(torch.float32)
-            halting_acc = halting_acc + weight_t
-            exp_steps = exp_steps + weight_t
-
-            # Early exit if everyone halted and min_steps satisfied
-            if t >= min_steps and torch.all(halting_acc >= (threshold - 1e-6)):
-                break
-
-        # Normalize in case sum(weights) < 1 due to epsilon; avoid division by zero
-        normalizer = torch.clamp(halting_acc, min=epsilon).view(b, 1, 1)
-        agg = agg / normalizer
-
-        # Cast back to original dtype
-        agg = agg.to(x_latents.dtype)
-        return agg, exp_steps
-
 
