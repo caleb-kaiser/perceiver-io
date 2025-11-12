@@ -252,10 +252,8 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
 
             for t in range(1, self.act_max_steps + 1):
-                print(f"ACT step {t}")
                 with torch.no_grad():
                     for i in range(self.num_inner_loops - 1):
-                        print(f"ACT inner loop {i}")
                         latents = self.inner_step(latents)
                 latents = self.inner_step(latents)
                 
@@ -274,7 +272,6 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
 
                 if not still_active.any():
-                    print(f"ACT step {t} no still_active")
                     break
 
             x_latents = latents #weighted_sums / halting_prob.unsqueeze(-1).unsqueeze(-1).clamp_min(1e-6)
