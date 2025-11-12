@@ -246,13 +246,16 @@ class EpisodicGridPerceiverIO(PerceiverIO):
             halting_prob = torch.zeros((b,), device=device, dtype=torch.float32)
             exp_steps = torch.zeros((b,), device=device, dtype=torch.float32)
             remainders = torch.zeros((b,), device=device, dtype=torch.float32)
-            weighted_sums = torch.zeros((b, n, d), device=device, dtype=torch.float32)
+            #weighted_sums = torch.zeros((b, n, d), device=device, dtype=torch.float32)
             n_updates = torch.zeros((b,), device=device, dtype=torch.int32)
             latents = x_latents
 
+
             for t in range(1, self.act_max_steps + 1):
+                print(f"ACT step {t}")
                 for i in range(self.num_inner_loops):
-                    latents, still_active, halting_prob, remainders, weighted_sums, n_updates = self.act_step(
+                    print(f"ACT inner loop {i}")
+                    latents, still_active, halting_prob, remainders, n_updates = self.act_step(
                         latents, 
                         self.act_threshold, 
                         self.act_epsilon, 
@@ -260,7 +263,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
                         still_active, 
                         halting_prob,
                         remainders,
-                        weighted_sums,
+                        #weighted_sums,
                         n_updates,
                     )
 
@@ -320,9 +323,9 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
         halting_prob = halting_prob + p_t * still_active.float() + new_halted.float() * (1.0 - halting_prob.float())
         remainders = remainders + new_halted.float() * (1.0 - halting_prob.float())
-        weighted_sums = weighted_sums + p_t.unsqueeze(-1).unsqueeze(-1) * x_latents.to(torch.float32)
+        #weighted_sums = weighted_sums + p_t.unsqueeze(-1).unsqueeze(-1) * x_latents.to(torch.float32)
         n_updates += still_active.int() + new_halted.int()
 
         
-        return x_latents, still_active, halting_prob, remainders, weighted_sums, n_updates
+        return x_latents, still_active, halting_prob, remainders, n_updates
 
