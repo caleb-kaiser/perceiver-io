@@ -298,7 +298,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         still_active: torch.Tensor,
         halting_prob: torch.Tensor,
         remainders: torch.Tensor,
-        weighted_sums: torch.Tensor,
+        #weighted_sums: torch.Tensor,
         n_updates: torch.Tensor,
     ) -> torch.Tensor:
         """
