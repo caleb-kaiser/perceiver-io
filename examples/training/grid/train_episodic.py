@@ -462,7 +462,12 @@ def main():
 
     # Wrap with DDP
     if is_distributed:
-        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None, output_device=device.index if device.type == "cuda" else None, find_unused_parameters=False)
+        model = DDP(
+            model, 
+            device_ids=[device.index] if device.type == "cuda" else None, 
+            output_device=device.index if device.type == "cuda" else None, 
+            find_unused_parameters=True
+        )
 
     optimizer = AdamAtan2(getattr(model, "module", model).parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     # loss_fn = nn.CrossEntropyLoss()
