@@ -314,7 +314,6 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
     def act_step(
         self, 
-        latents: torch.Tensor, 
         threshold: float, 
         epsilon: float, 
         temperature: float,
