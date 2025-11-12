@@ -253,22 +253,28 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
             for t in range(1, self.act_max_steps + 1):
                 print(f"ACT step {t}")
-                for i in range(self.num_inner_loops):
-                    print(f"ACT inner loop {i}")
-                    latents, still_active, halting_prob, remainders, n_updates = self.act_step(
-                        latents, 
+                with torch.no_grad():
+                    for i in range(self.num_inner_loops - 1):
+                        print(f"ACT inner loop {i}")
+                        latents = self.inner_step(latents)
+                latents = self.inner_step(latents)
+                
+                still_active, halting_prob, remainders, n_updates = self.act_step(
                         self.act_threshold, 
                         self.act_epsilon, 
                         self.act_temperature, 
                         still_active, 
                         halting_prob,
                         remainders,
-                        #weighted_sums,
                         n_updates,
                     )
 
-                    if not still_active.any():
-                        break
+                
+
+
+                if not still_active.any():
+                    print(f"ACT step {t} no still_active")
+                    break
 
             x_latents = latents #weighted_sums / halting_prob.unsqueeze(-1).unsqueeze(-1).clamp_min(1e-6)
 
@@ -289,6 +295,23 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         return self.decoder(x_latents, x_adapted=x_adapted_query)
 
 
+    def inner_step(
+        self,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        One inner step of ACT refinement.
+        """
+        x_latents = self.encoder.self_attn_1(latents).last_hidden_state
+        cross_attn_n = self.encoder.cross_attn_n if self.encoder.extra_cross_attention_layer else self.encoder.cross_attn_1
+        self_attn_n = self.encoder.self_attn_n if self.encoder.extra_self_attention_block else self.encoder.self_attn_1
+        for i in range(1, self.encoder.num_self_attention_blocks):
+            if i < self.encoder.num_cross_attention_layers:
+                x_latents = cross_attn_n(x_latents, x_latent).last_hidden_state
+            x_latents = self_attn_n(x_latents).last_hidden_state
+
+        return x_latents
+
     def act_step(
         self, 
         latents: torch.Tensor, 
@@ -304,13 +327,6 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         """
         One step of ACT refinement.
         """
-        x_latents = self.encoder.self_attn_1(latents).last_hidden_state
-        cross_attn_n = self.encoder.cross_attn_n if self.encoder.extra_cross_attention_layer else self.encoder.cross_attn_1
-        self_attn_n = self.encoder.self_attn_n if self.encoder.extra_self_attention_block else self.encoder.self_attn_1
-        for i in range(1, self.encoder.num_self_attention_blocks):
-            if i < self.encoder.num_cross_attention_layers:
-                x_latents = cross_attn_n(x_latents, x_latent).last_hidden_state
-            x_latents = self_attn_n(x_latents).last_hidden_state
 
         pooled = x_latents.mean(dim=1)  # (B, D)
         halted_logits = self._halt_proj(self._halt_norm(pooled)).squeeze(-1)  # (B,)
@@ -327,5 +343,5 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         n_updates += still_active.int() + new_halted.int()
 
         
-        return x_latents, still_active, halting_prob, remainders, n_updates
+        return still_active, halting_prob, remainders, n_updates
 
