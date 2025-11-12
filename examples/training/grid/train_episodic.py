@@ -350,7 +350,7 @@ def dump_debug_images(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default=None)
+    parser.add_argument("--data", type=str, help="Path to episodic JSON data with 'puzzles'.", default="../ARC-AGI/data")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -366,11 +366,11 @@ def main():
     # Distributed options (auto-detected when using torchrun)
     parser.add_argument("--dist-backend", type=str, default="nccl")
     # ACT options
-    parser.add_argument("--act-enabled", action="store_true")
+    parser.add_argument("--act-enabled", action="store_true", default=True)
     parser.add_argument("--act-max-steps", type=int, default=100)
-    parser.add_argument("--act-threshold", type=float, default=0.9)
+    parser.add_argument("--act-threshold", type=float, default=0.99)
     parser.add_argument("--act-epsilon", type=float, default=1e-2)
-    parser.add_argument("--act-min-steps", type=int, default=18)
+    parser.add_argument("--act-min-steps", type=int, default=1)
     parser.add_argument("--act-temperature", type=float, default=1.0)
     parser.add_argument("--act-ponder-cost", type=float, default=1e-3)
     args = parser.parse_args()
@@ -447,11 +447,11 @@ def main():
         max_support=max(5, args.support_k),
         num_latents=30 * 30,
         num_latent_channels=512,
-        num_cross_attention_heads=4,
-        num_self_attention_heads=4,
-        num_self_attention_layers_per_block=4,
+        num_cross_attention_heads=8,
+        num_self_attention_heads=8,
+        num_self_attention_layers_per_block=2,
         num_self_attention_blocks=2,
-        num_inner_loops=6,
+        num_inner_loops=18,
         act_enabled=args.act_enabled,
         act_max_steps=args.act_max_steps,
         act_threshold=args.act_threshold,

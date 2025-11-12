@@ -39,6 +39,8 @@ torchmetrics = "^0.9"
 torch-optimizer = "^0.3"
 tensorboard = "^2.11"
 einops = "*"
+adam-atan2-pytorch = "*"
+pydantic = "*"
 datasets = {version = "^2.4", optional = true}
 tokenizers = {version = "^0.12", optional = true}
 transformers = {version = "^4.28", optional = true}

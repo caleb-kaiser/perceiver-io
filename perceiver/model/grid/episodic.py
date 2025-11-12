@@ -250,7 +250,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
             n_updates = torch.zeros((b,), device=device, dtype=torch.int32)
             latents = x_latents
 
-            for t in range(1, self.act_min_steps + 1):
+            for t in range(1, self.act_max_steps + 1):
                 for i in range(self.num_inner_loops):
                     latents, still_active, halting_prob, remainders, weighted_sums, n_updates = self.act_step(
                         latents, 
@@ -267,7 +267,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
                     if not still_active.any():
                         break
 
-            x_latents = weighted_sums / halting_prob.unsqueeze(-1).unsqueeze(-1).clamp_min(1e-6)
+            x_latents = latents #weighted_sums / halting_prob.unsqueeze(-1).unsqueeze(-1).clamp_min(1e-6)
 
 
 
