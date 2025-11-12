@@ -260,6 +260,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
                 latents = self.inner_step(latents)
                 
                 still_active, halting_prob, remainders, n_updates = self.act_step(
+                        latents,
                         self.act_threshold, 
                         self.act_epsilon, 
                         self.act_temperature, 
@@ -314,6 +315,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
 
     def act_step(
         self, 
+        latents: torch.Tensor, 
         threshold: float, 
         epsilon: float, 
         temperature: float,
@@ -327,7 +329,7 @@ class EpisodicGridPerceiverIO(PerceiverIO):
         One step of ACT refinement.
         """
 
-        pooled = x_latents.mean(dim=1)  # (B, D)
+        pooled = latents.mean(dim=1)  # (B, D)
         halted_logits = self._halt_proj(self._halt_norm(pooled)).squeeze(-1)  # (B,)
 
         p_t = torch.sigmoid(halted_logits).to(torch.float32)  # (B,)
